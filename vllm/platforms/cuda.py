@@ -525,13 +525,35 @@ class CudaPlatformBase(Platform):
 # the major benefit of using NVML is that it will not initialize CUDA
 class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
+    def _get_handle_for_visible_device(cls, device_id: int = 0):
+        if (
+            cls.device_control_env_var in os.environ
+            and os.environ[cls.device_control_env_var] != ""
+        ):
+            device_ids = os.environ[cls.device_control_env_var].split(",")
+            visible_device = device_ids[device_id].strip()
+            if visible_device.isdigit():
+                return pynvml.nvmlDeviceGetHandleByIndex(int(visible_device))
+            return pynvml.nvmlDeviceGetHandleByUUID(visible_device.encode("utf-8"))
+
+        return pynvml.nvmlDeviceGetHandleByIndex(device_id)
+
+    @classmethod
     @cache
     @with_nvml_context
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         try:
-            physical_device_id = cls.device_id_to_physical_device_id(device_id)
-            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
-            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            handle = cls._get_handle_for_visible_device(device_id)
+            try:
+                major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            except pynvml.NVMLError:
+                if pynvml.nvmlDeviceIsMigDeviceHandle(handle):
+                    handle = pynvml.nvmlDeviceGetDeviceHandleFromMigDeviceHandle(
+                        handle
+                    )
+                    major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+                else:
+                    raise
             return DeviceCapability(major=major, minor=minor)
         except RuntimeError:
             return None
@@ -551,21 +573,19 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @with_nvml_context
     def get_device_name(cls, device_id: int = 0) -> str:
-        physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        return cls._get_physical_device_name(physical_device_id)
+        handle = cls._get_handle_for_visible_device(device_id)
+        return pynvml.nvmlDeviceGetName(handle)
 
     @classmethod
     @with_nvml_context
     def get_device_uuid(cls, device_id: int = 0) -> str:
-        physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+        handle = cls._get_handle_for_visible_device(device_id)
         return pynvml.nvmlDeviceGetUUID(handle)
 
     @classmethod
     @with_nvml_context
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+        handle = cls._get_handle_for_visible_device(device_id)
         return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
 
     @classmethod

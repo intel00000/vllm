@@ -206,7 +206,7 @@ class Platform:
         return cls.simple_compile_backend
 
     @classmethod
-    def device_id_to_physical_device_id(cls, device_id: int):
+    def device_id_to_physical_device_id(cls, device_id: int) -> int | str:
         # Treat empty device control env var as unset. This is a valid
         # configuration in Ray setups where the engine is launched in
         # a CPU-only placement group located on a GPU node.
@@ -215,8 +215,12 @@ class Platform:
             and os.environ[cls.device_control_env_var] != ""
         ):
             device_ids = os.environ[cls.device_control_env_var].split(",")
-            physical_device_id = device_ids[device_id]
-            return int(physical_device_id)
+            physical_device_id = device_ids[device_id].strip()
+            # On MIG systems, CUDA_VISIBLE_DEVICES may contain a UUID like
+            # "MIG-<uuid>" instead of an integer physical device index.
+            if physical_device_id.isdigit():
+                return int(physical_device_id)
+            return physical_device_id
         else:
             return device_id
 
