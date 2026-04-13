@@ -152,6 +152,23 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+        # CUDA stream used for request execution. The actual stream object is
+        # created in init_device() after the worker has selected its CUDA
+        # device. A value of 0 keeps the default stream behavior; any non-zero
+        # value allocates a dedicated stream for this worker.
+        self._work_stream_id = int(os.environ.get("VLLM_WORK_STREAM_ID", "0"))
+        self._work_stream: torch.cuda.Stream | None = None
+
+        # Monotonic scheduler step counter for NVTX annotation.
+        self._sched_step: int = 0
+
+    def _work_stream_context(self) -> AbstractContextManager:
+        if self._work_stream is None:
+            raise RuntimeError(
+                "Work stream is not initialized. Call init_device() first."
+            )
+        return torch.cuda.stream(self._work_stream)
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -255,6 +272,11 @@ class Worker(WorkerBase):
 
             self.device = torch.device(f"cuda:{self.local_rank}")
             current_platform.set_device(self.device)
+            self._work_stream = (
+                torch.cuda.default_stream(self.device)
+                if self._work_stream_id == 0
+                else torch.cuda.Stream(device=self.device)
+            )
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -636,33 +658,60 @@ class Worker(WorkerBase):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.
         # A context request is a request that has not yet generated any tokens
-        if not self.profiler:
-            return nullcontext()
 
-        self.profiler.step()
+        # Step the profiler for iteration tracking (delay / max-iter logic)
+        if self.profiler:
+            self.profiler.step()
+
+        # Determine whether we should emit NVTX annotations.  We annotate
+        # when the profiler is running (normal path) OR when a profiler_config
+        # is present even though start_profile() hasn't been called yet.  The
+        # second case supports overlap scenarios where a secondary model needs
+        # visible NVTX tags without owning the cudaProfilerStart/Stop
+        # lifecycle.
+        profiler_type = self.profiler_config.profiler if self.profiler_config else None
+        if not self.profiler and profiler_type is None:
+            return nullcontext()
 
         iteration_details = compute_iteration_details(scheduler_output)
 
-        annotation = "".join(
-            [
-                "execute_context_",
-                str(iteration_details.num_ctx_requests),
-                "(",
-                str(iteration_details.num_ctx_tokens),
-                ")_generation_",
-                str(iteration_details.num_generation_requests),
-                "(",
-                str(iteration_details.num_generation_tokens),
-                ")",
-            ]
-        )
-        return self.profiler.annotate_context_manager(annotation)
+        self._sched_step += 1
+
+        _LONG_SEQ_THRESHOLD = 32768
+        _max_seq = iteration_details.max_seq_tokens
+        parts = [
+            "step_",
+            str(self._sched_step),
+            "_execute_context_",
+            str(iteration_details.num_ctx_requests),
+            "(",
+            str(iteration_details.num_ctx_tokens),
+            ")_generation_",
+            str(iteration_details.num_generation_requests),
+            "(",
+            str(iteration_details.num_generation_tokens),
+            ")_maxseq_",
+            str(_max_seq),
+        ]
+        if _max_seq > _LONG_SEQ_THRESHOLD:
+            parts.append("_LONG")
+        annotation = "".join(parts)
+
+        if self.profiler:
+            return self.profiler.annotate_context_manager(annotation)
+        # Fallback: profiler_config is set but start_profile() wasn't called.
+        # Emit NVTX directly so the annotation is visible in nsys.
+        return torch.cuda.nvtx.range(annotation)
 
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        # Keep sampling on the same stream as execute_model(). For the V2 model
+        # runner this also ensures AsyncOutput records the correct main_stream
+        # for its D2H copies.
+        with self._work_stream_context():
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     def execute_model(
@@ -724,7 +773,7 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
+        with self._work_stream_context(), self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
