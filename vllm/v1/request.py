@@ -19,6 +19,7 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+    infer_model_id,
 )
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -62,6 +63,7 @@ class Request:
         prompt_token_ids: list[int] | None,
         sampling_params: SamplingParams | None,
         pooling_params: PoolingParams | None,
+        model_id: str | None = None,
         client_index: int = 0,
         arrival_time: float | None = None,
         prompt_embeds: torch.Tensor | None = None,
@@ -79,6 +81,7 @@ class Request:
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
+        self.model_id = infer_model_id(sampling_params, pooling_params, model_id)
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
@@ -190,6 +193,7 @@ class Request:
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
+            model_id=request.model_id,
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
             cache_salt=request.cache_salt,

@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from unittest.mock import Mock
+
+import pytest
+
+from vllm.pooling_params import PoolingParams
+from vllm.platforms import current_platform
+from vllm.v1.request import Request, RequestStatus
+from vllm.v1.worker.dual_model_helpers import DualModelConfig
+
+from .utils import create_requests, create_scheduler
+
+pytestmark = pytest.mark.cpu_test
+
+
+def test_dual_model_embed_requests_allocate_and_free_kv(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    scheduler = create_scheduler()
+    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+
+    decode_request = create_requests(num_requests=1, num_tokens=8)[0]
+    embed_request = Request(
+        request_id="embed-0",
+        prompt_token_ids=[7] * 8,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+
+    original_allocate_slots = scheduler.kv_cache_manager.allocate_slots
+    allocate_mock = Mock(side_effect=original_allocate_slots)
+    scheduler.kv_cache_manager.allocate_slots = allocate_mock
+
+    original_free = scheduler.kv_cache_manager.free
+    free_mock = Mock(side_effect=original_free)
+    scheduler.kv_cache_manager.free = free_mock
+
+    scheduler.add_request(decode_request)
+    scheduler.add_request(embed_request)
+
+    output = scheduler.schedule()
+    new_req_by_id = {req.req_id: req for req in output.scheduled_new_reqs}
+
+    assert allocate_mock.call_count == 2
+    assert {
+        call.args[0].request_id for call in allocate_mock.call_args_list
+    } == {decode_request.request_id, embed_request.request_id}
+    assert new_req_by_id[embed_request.request_id].block_ids != ([],)
+    assert output.num_scheduled_tokens[embed_request.request_id] == 8
+
+    scheduler.finish_requests(embed_request.request_id, RequestStatus.FINISHED_ABORTED)
+    assert free_mock.call_count == 1
+
+    scheduler.finish_requests(decode_request.request_id, RequestStatus.FINISHED_ABORTED)
+    assert free_mock.call_count == 2

@@ -63,6 +63,19 @@ class FinishReason(enum.IntEnum):
         return FINISH_REASON_STRINGS[self.value]
 
 
+def infer_model_id(
+    sampling_params: SamplingParams | None,
+    pooling_params: PoolingParams | None,
+    explicit_model_id: str | None = None,
+) -> str:
+    if explicit_model_id is not None:
+        return explicit_model_id
+    if sampling_params is not None:
+        return "decode"
+    assert pooling_params is not None
+    return pooling_params.task
+
+
 class EngineCoreRequest(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -89,6 +102,7 @@ class EngineCoreRequest(
     # a wave finished notification is received.
     current_wave: int = 0
     priority: int = 0
+    model_id: str | None = None
 
     trace_headers: Mapping[str, str] | None = None
     resumable: bool = False
@@ -108,6 +122,14 @@ class EngineCoreRequest(
             return self.sampling_params
         assert self.pooling_params is not None
         return self.pooling_params
+
+    @property
+    def resolved_model_id(self) -> str:
+        return infer_model_id(
+            self.sampling_params,
+            self.pooling_params,
+            self.model_id,
+        )
 
 
 class EngineCoreEventType(enum.IntEnum):

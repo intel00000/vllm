@@ -263,7 +263,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
 
-    def load_model(self, *args, **kwargs) -> None:
+    def load_model(self, *args, prefix: str = "", **kwargs) -> None:
         time_before_load = time.perf_counter()
         with DeviceMemoryProfiler() as m:
             model_loader = get_model_loader(self.vllm_config.load_config)
@@ -272,6 +272,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config,
                 model_config=self.vllm_config.model_config,
+                prefix=prefix,
             )
             if self.lora_config:
                 self.model = self.load_lora_model(

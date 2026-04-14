@@ -317,6 +317,9 @@ class InputProcessor:
             mm_features=mm_features,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
+            model_id=(
+                "decode" if sampling_params is not None else pooling_params.task
+            ),
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
