@@ -27,6 +27,7 @@ class DualModelConfig:
     decode_running_reserve: int | None = None
     max_embed_running_reqs: int | None = None
     embed_release_running_decode_threshold: int | None = None
+    embed_release_when_decode_waiting_drained: bool = False
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "DualModelConfig | None":
@@ -57,6 +58,9 @@ class DualModelConfig:
             max_embed_running_reqs=raw_cfg.get("max_embed_running_reqs"),
             embed_release_running_decode_threshold=raw_cfg.get(
                 "embed_release_running_decode_threshold"
+            ),
+            embed_release_when_decode_waiting_drained=bool(
+                raw_cfg.get("embed_release_when_decode_waiting_drained", False)
             ),
         )
 

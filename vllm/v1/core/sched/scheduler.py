@@ -174,6 +174,8 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._embed_wait_drained_phase_started = False
+        self._embed_wait_drained_phase_released = False
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1034,11 +1036,24 @@ class Scheduler(SchedulerInterface):
             return False
 
         running_decode, running_embed = self._count_running_by_model()
+        waiting_decode_total = (
+            self._count_queue_by_model(self.waiting)[0]
+            + self._count_queue_by_model(self.skipped_waiting)[0]
+        )
         if (
             dual_cfg.max_embed_running_reqs is not None
             and running_embed >= dual_cfg.max_embed_running_reqs
         ):
             return True
+
+        if dual_cfg.embed_release_when_decode_waiting_drained:
+            if waiting_decode_total > 0:
+                self._embed_wait_drained_phase_started = True
+                return True
+            if not self._embed_wait_drained_phase_started:
+                return running_decode > 0
+            if not self._embed_wait_drained_phase_released:
+                self._embed_wait_drained_phase_released = True
 
         if (
             dual_cfg.embed_release_running_decode_threshold is not None
