@@ -24,6 +24,9 @@ class DualModelConfig:
     embed_dtype: str | None = None
     embed_max_model_len: int | None = None
     embed_enforce_eager: bool | None = None
+    decode_running_reserve: int | None = None
+    max_embed_running_reqs: int | None = None
+    embed_release_running_decode_threshold: int | None = None
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "DualModelConfig | None":
@@ -50,6 +53,11 @@ class DualModelConfig:
             embed_dtype=raw_cfg.get("embed_dtype"),
             embed_max_model_len=raw_cfg.get("embed_max_model_len"),
             embed_enforce_eager=raw_cfg.get("embed_enforce_eager"),
+            decode_running_reserve=raw_cfg.get("decode_running_reserve"),
+            max_embed_running_reqs=raw_cfg.get("max_embed_running_reqs"),
+            embed_release_running_decode_threshold=raw_cfg.get(
+                "embed_release_running_decode_threshold"
+            ),
         )
 
 

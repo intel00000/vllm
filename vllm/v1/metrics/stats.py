@@ -175,6 +175,10 @@ class SchedulerStats:
     num_waiting_reqs: int = 0
     num_scheduled_reqs: int = 0
     total_num_scheduled_tokens: int = 0
+    num_running_decode_reqs: int = 0
+    num_running_embed_reqs: int = 0
+    num_waiting_decode_reqs: int = 0
+    num_waiting_embed_reqs: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

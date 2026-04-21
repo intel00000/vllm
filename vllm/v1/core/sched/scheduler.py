@@ -619,6 +619,11 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
                 request_uses_kv_cache = self._request_uses_kv_cache(request)
 
+                if self._should_skip_embed_waiting_request(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -990,6 +995,68 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def _count_running_by_model(self) -> tuple[int, int]:
+        if self.dual_model_config is None:
+            return 0, 0
+        decode_model_id = self.dual_model_config.decode_model_id
+        embed_model_id = self.dual_model_config.embed_model_id
+        running_decode = sum(
+            1 for request in self.running if request.model_id == decode_model_id
+        )
+        running_embed = sum(
+            1 for request in self.running if request.model_id == embed_model_id
+        )
+        return running_decode, running_embed
+
+    def _count_queue_by_model(self, request_queue: RequestQueue) -> tuple[int, int]:
+        if self.dual_model_config is None:
+            return 0, 0
+        decode_model_id = self.dual_model_config.decode_model_id
+        embed_model_id = self.dual_model_config.embed_model_id
+        waiting_decode = sum(
+            1 for request in request_queue if request.model_id == decode_model_id
+        )
+        waiting_embed = sum(
+            1 for request in request_queue if request.model_id == embed_model_id
+        )
+        return waiting_decode, waiting_embed
+
+    def _has_waiting_decode_request(self, request_queue: RequestQueue) -> bool:
+        if self.dual_model_config is None:
+            return False
+        decode_model_id = self.dual_model_config.decode_model_id
+        return any(request.model_id == decode_model_id for request in request_queue)
+
+    def _should_skip_embed_waiting_request(self, request: Request) -> bool:
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
+            return False
+
+        running_decode, running_embed = self._count_running_by_model()
+        if (
+            dual_cfg.max_embed_running_reqs is not None
+            and running_embed >= dual_cfg.max_embed_running_reqs
+        ):
+            return True
+
+        if (
+            dual_cfg.embed_release_running_decode_threshold is not None
+            and running_decode > dual_cfg.embed_release_running_decode_threshold
+        ):
+            return True
+
+        if (
+            dual_cfg.decode_running_reserve is not None
+            and running_decode < dual_cfg.decode_running_reserve
+            and (
+                self._has_waiting_decode_request(self.waiting)
+                or self._has_waiting_decode_request(self.skipped_waiting)
+            )
+        ):
+            return True
+
+        return False
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -2000,11 +2067,22 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        running_decode, running_embed = self._count_running_by_model()
+        waiting_decode_main, waiting_embed_main = self._count_queue_by_model(
+            self.waiting
+        )
+        waiting_decode_skipped, waiting_embed_skipped = self._count_queue_by_model(
+            self.skipped_waiting
+        )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
             num_scheduled_reqs=num_scheduled_reqs,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            num_running_decode_reqs=running_decode,
+            num_running_embed_reqs=running_embed,
+            num_waiting_decode_reqs=waiting_decode_main + waiting_decode_skipped,
+            num_waiting_embed_reqs=waiting_embed_main + waiting_embed_skipped,
             kv_cache_usage=self.kv_cache_manager.usage,
             encoder_cache_usage=self._get_encoder_cache_usage(),
             prefix_cache_stats=prefix_cache_stats,

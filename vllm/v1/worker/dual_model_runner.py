@@ -374,28 +374,15 @@ class DualModelRunner:
             )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
+        with _nvtx_range("decode_sample"):
+            decode_output = self.decode_runner.sample_tokens(grammar_output)
         embed_output = self.pending_embed_output
-        embed_pool_event: torch.cuda.Event | None = None
         if self.pending_embed_needs_pool:
             with torch.cuda.stream(self.embed_stream):
                 with _nvtx_range("embed_pool"):
                     embed_output = self.embed_runner.pool()
-                embed_pool_event = torch.cuda.Event()
-                embed_pool_event.record(self.embed_stream)
             if embed_output is None:
                 raise RuntimeError("Embed runner failed to produce pooling output.")
-
-        with torch.cuda.stream(self.decode_stream):
-            with _nvtx_range("decode_sample"):
-                decode_output = self.decode_runner.sample_tokens(grammar_output)
-            decode_sample_event = torch.cuda.Event()
-            decode_sample_event.record(self.decode_stream)
-
-        current_stream = torch.cuda.current_stream()
-        current_stream.wait_event(decode_sample_event)
-        if embed_pool_event is not None:
-            current_stream.wait_event(embed_pool_event)
-
         with _nvtx_range("merge_outputs"):
             merged = merge_model_runner_outputs(
                 scheduled_req_order=self.pending_req_order,
