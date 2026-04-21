@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+from contextlib import contextmanager
 from dataclasses import is_dataclass
 from typing import Any
 
@@ -27,6 +28,15 @@ from vllm.v1.worker.dual_model_helpers import (
     split_scheduler_output_by_model,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class DualModelRunner:
@@ -318,18 +328,20 @@ class DualModelRunner:
         decode_output = None
         if split_outputs.decode.num_scheduled_tokens or split_outputs.decode.finished_req_ids:
             with torch.cuda.stream(self.decode_stream):
-                decode_output = self.decode_runner.execute_model(
-                    split_outputs.decode,
-                    intermediate_tensors=intermediate_tensors,
-                )
+                with _nvtx_range("decode_execute"):
+                    decode_output = self.decode_runner.execute_model(
+                        split_outputs.decode,
+                        intermediate_tensors=intermediate_tensors,
+                    )
 
         embed_exec_output = None
         embed_output: ModelRunnerOutput | None = None
         if split_outputs.embed.num_scheduled_tokens or split_outputs.embed.finished_req_ids:
             with torch.cuda.stream(self.embed_stream):
-                embed_exec_output = self.embed_runner.execute_model(
-                    split_outputs.embed,
-                )
+                with _nvtx_range("embed_execute"):
+                    embed_exec_output = self.embed_runner.execute_model(
+                        split_outputs.embed,
+                    )
 
         decode_needs_sample = (
             decode_output is None and bool(split_outputs.decode.num_scheduled_tokens)
@@ -343,34 +355,53 @@ class DualModelRunner:
             return None
 
         if split_outputs.embed.num_scheduled_tokens or split_outputs.embed.finished_req_ids:
-            embed_output = (
-                self.embed_runner.pool()
-                if embed_exec_output is None
-                else embed_exec_output
-            )
+            if embed_exec_output is None:
+                with torch.cuda.stream(self.embed_stream):
+                    with _nvtx_range("embed_pool"):
+                        embed_output = self.embed_runner.pool()
+            else:
+                embed_output = embed_exec_output
             if embed_output is None:
                 raise RuntimeError("Embed runner failed to produce pooling output.")
 
         self.pending_embed_output = None
         self.pending_embed_needs_pool = False
-        return merge_model_runner_outputs(
-            scheduled_req_order=self.pending_req_order,
-            decode_output=decode_output,
-            embed_output=embed_output,
-        )
+        with _nvtx_range("merge_outputs"):
+            return merge_model_runner_outputs(
+                scheduled_req_order=self.pending_req_order,
+                decode_output=decode_output,
+                embed_output=embed_output,
+            )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
-        decode_output = self.decode_runner.sample_tokens(grammar_output)
         embed_output = self.pending_embed_output
+        embed_pool_event: torch.cuda.Event | None = None
         if self.pending_embed_needs_pool:
-            embed_output = self.embed_runner.pool()
+            with torch.cuda.stream(self.embed_stream):
+                with _nvtx_range("embed_pool"):
+                    embed_output = self.embed_runner.pool()
+                embed_pool_event = torch.cuda.Event()
+                embed_pool_event.record(self.embed_stream)
             if embed_output is None:
                 raise RuntimeError("Embed runner failed to produce pooling output.")
-        merged = merge_model_runner_outputs(
-            scheduled_req_order=self.pending_req_order,
-            decode_output=decode_output,
-            embed_output=embed_output,
-        )
+
+        with torch.cuda.stream(self.decode_stream):
+            with _nvtx_range("decode_sample"):
+                decode_output = self.decode_runner.sample_tokens(grammar_output)
+            decode_sample_event = torch.cuda.Event()
+            decode_sample_event.record(self.decode_stream)
+
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(decode_sample_event)
+        if embed_pool_event is not None:
+            current_stream.wait_event(embed_pool_event)
+
+        with _nvtx_range("merge_outputs"):
+            merged = merge_model_runner_outputs(
+                scheduled_req_order=self.pending_req_order,
+                decode_output=decode_output,
+                embed_output=embed_output,
+            )
         self.pending_embed_output = None
         self.pending_embed_needs_pool = False
         self.pending_req_order = []
