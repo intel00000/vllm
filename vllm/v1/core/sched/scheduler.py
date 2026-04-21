@@ -615,7 +615,8 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
+                if request_queue is None:
+                    break
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
@@ -1694,7 +1695,50 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    def _is_embed_gate_blocked_without_state_change(self,
+                                                    request: Request) -> bool:
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
+            return False
+
+        running_decode, running_embed = self._count_running_by_model()
+        waiting_decode_total = (
+            self._count_queue_by_model(self.waiting)[0]
+            + self._count_queue_by_model(self.skipped_waiting)[0]
+        )
+
+        if (dual_cfg.max_embed_running_reqs is not None
+                and running_embed >= dual_cfg.max_embed_running_reqs):
+            return True
+
+        if dual_cfg.embed_release_when_decode_waiting_drained:
+            if waiting_decode_total > 0:
+                return True
+            if (not self._embed_wait_drained_phase_started
+                    and running_decode > 0):
+                return True
+            if not self._embed_wait_drained_phase_released:
+                return False
+
+        if (dual_cfg.embed_release_running_decode_threshold is not None
+                and running_decode
+                > dual_cfg.embed_release_running_decode_threshold):
+            return True
+
+        if (dual_cfg.decode_running_reserve is not None
+                and running_decode < dual_cfg.decode_running_reserve
+                and (self._has_waiting_decode_request(self.waiting)
+                     or self._has_waiting_decode_request(self.skipped_waiting))):
+            return True
+
+        return False
+
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        if self.skipped_waiting:
+            skipped_req = self.skipped_waiting.peek_request()
+            if self._is_embed_gate_blocked_without_state_change(skipped_req):
+                return self.waiting or None
+
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
