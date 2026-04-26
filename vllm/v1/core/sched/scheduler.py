@@ -1025,6 +1025,35 @@ class Scheduler(SchedulerInterface):
         )
         return waiting_decode, waiting_embed
 
+    def _count_scheduled_by_model(
+        self,
+        num_scheduled_tokens: dict[str, int],
+    ) -> tuple[int, int, int, int]:
+        if self.dual_model_config is None:
+            return 0, 0, 0, 0
+        decode_model_id = self.dual_model_config.decode_model_id
+        embed_model_id = self.dual_model_config.embed_model_id
+        scheduled_decode_reqs = 0
+        scheduled_embed_reqs = 0
+        scheduled_decode_tokens = 0
+        scheduled_embed_tokens = 0
+        for request_id, num_tokens in num_scheduled_tokens.items():
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            if request.model_id == decode_model_id:
+                scheduled_decode_reqs += 1
+                scheduled_decode_tokens += num_tokens
+            elif request.model_id == embed_model_id:
+                scheduled_embed_reqs += 1
+                scheduled_embed_tokens += num_tokens
+        return (
+            scheduled_decode_reqs,
+            scheduled_embed_reqs,
+            scheduled_decode_tokens,
+            scheduled_embed_tokens,
+        )
+
     def _has_waiting_decode_request(self, request_queue: RequestQueue) -> bool:
         if self.dual_model_config is None:
             return False
@@ -1662,10 +1691,16 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        scheduled_by_model = self._count_scheduled_by_model(
+            scheduler_output.num_scheduled_tokens)
         if (
             stats := self.make_stats(
                 num_scheduled_reqs=len(scheduler_output.num_scheduled_tokens),
                 total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_scheduled_decode_reqs=scheduled_by_model[0],
+                num_scheduled_embed_reqs=scheduled_by_model[1],
+                total_num_scheduled_decode_tokens=scheduled_by_model[2],
+                total_num_scheduled_embed_tokens=scheduled_by_model[3],
                 spec_decoding_stats=spec_decoding_stats,
                 kv_connector_stats=kv_connector_stats,
                 cudagraph_stats=cudagraph_stats,
@@ -2104,6 +2139,10 @@ class Scheduler(SchedulerInterface):
         self,
         num_scheduled_reqs: int = 0,
         total_num_scheduled_tokens: int = 0,
+        num_scheduled_decode_reqs: int = 0,
+        num_scheduled_embed_reqs: int = 0,
+        total_num_scheduled_decode_tokens: int = 0,
+        total_num_scheduled_embed_tokens: int = 0,
         spec_decoding_stats: SpecDecodingStats | None = None,
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
@@ -2138,6 +2177,10 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
             num_scheduled_reqs=num_scheduled_reqs,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            num_scheduled_decode_reqs=num_scheduled_decode_reqs,
+            num_scheduled_embed_reqs=num_scheduled_embed_reqs,
+            total_num_scheduled_decode_tokens=total_num_scheduled_decode_tokens,
+            total_num_scheduled_embed_tokens=total_num_scheduled_embed_tokens,
             num_running_decode_reqs=running_decode,
             num_running_embed_reqs=running_embed,
             num_waiting_decode_reqs=waiting_decode_main + waiting_decode_skipped,
