@@ -174,6 +174,10 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._num_running_decode_reqs = 0
+        self._num_running_embed_reqs = 0
+        self._num_waiting_decode_reqs = 0
+        self._num_waiting_embed_reqs = 0
         self._embed_wait_drained_phase_started = False
         self._embed_wait_drained_phase_released = False
 
@@ -857,7 +861,9 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                self._mark_waiting_removed_by_model(request)
                 self.running.append(request)
+                self._mark_running_added_by_model(request)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -999,18 +1005,52 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
+    def _dual_model_request_kind(self, request: Request) -> str | None:
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None:
+            return None
+        if request.model_id == dual_cfg.decode_model_id:
+            return "decode"
+        if request.model_id == dual_cfg.embed_model_id:
+            return "embed"
+        return None
+
+    def _mark_waiting_added_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            self._num_waiting_decode_reqs += 1
+        elif kind == "embed":
+            self._num_waiting_embed_reqs += 1
+
+    def _mark_waiting_removed_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            assert self._num_waiting_decode_reqs > 0
+            self._num_waiting_decode_reqs -= 1
+        elif kind == "embed":
+            assert self._num_waiting_embed_reqs > 0
+            self._num_waiting_embed_reqs -= 1
+
+    def _mark_running_added_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            self._num_running_decode_reqs += 1
+        elif kind == "embed":
+            self._num_running_embed_reqs += 1
+
+    def _mark_running_removed_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            assert self._num_running_decode_reqs > 0
+            self._num_running_decode_reqs -= 1
+        elif kind == "embed":
+            assert self._num_running_embed_reqs > 0
+            self._num_running_embed_reqs -= 1
+
     def _count_running_by_model(self) -> tuple[int, int]:
         if self.dual_model_config is None:
             return 0, 0
-        decode_model_id = self.dual_model_config.decode_model_id
-        embed_model_id = self.dual_model_config.embed_model_id
-        running_decode = sum(
-            1 for request in self.running if request.model_id == decode_model_id
-        )
-        running_embed = sum(
-            1 for request in self.running if request.model_id == embed_model_id
-        )
-        return running_decode, running_embed
+        return self._num_running_decode_reqs, self._num_running_embed_reqs
 
     def _count_queue_by_model(self, request_queue: RequestQueue) -> tuple[int, int]:
         if self.dual_model_config is None:
@@ -1060,16 +1100,26 @@ class Scheduler(SchedulerInterface):
         decode_model_id = self.dual_model_config.decode_model_id
         return any(request.model_id == decode_model_id for request in request_queue)
 
+    @staticmethod
+    def _embed_waiting_gate_enabled(dual_cfg: DualModelConfig) -> bool:
+        return (
+            dual_cfg.max_embed_running_reqs is not None
+            or dual_cfg.embed_release_when_decode_waiting_drained
+            or dual_cfg.embed_release_running_decode_threshold is not None
+            or dual_cfg.decode_running_reserve is not None
+        )
+
     def _should_skip_embed_waiting_request(self, request: Request) -> bool:
         dual_cfg = self.dual_model_config
         if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
             return False
 
-        running_decode, running_embed = self._count_running_by_model()
-        waiting_decode_total = (
-            self._count_queue_by_model(self.waiting)[0]
-            + self._count_queue_by_model(self.skipped_waiting)[0]
-        )
+        if not self._embed_waiting_gate_enabled(dual_cfg):
+            return False
+
+        running_decode = self._num_running_decode_reqs
+        running_embed = self._num_running_embed_reqs
+        waiting_decode_total = self._num_waiting_decode_reqs
         if (
             dual_cfg.max_embed_running_reqs is not None
             and running_embed >= dual_cfg.max_embed_running_reqs
@@ -1095,8 +1145,7 @@ class Scheduler(SchedulerInterface):
             dual_cfg.decode_running_reserve is not None
             and running_decode < dual_cfg.decode_running_reserve
             and (
-                self._has_waiting_decode_request(self.waiting)
-                or self._has_waiting_decode_request(self.skipped_waiting)
+                waiting_decode_total > 0
             )
         ):
             return True
@@ -1124,7 +1173,9 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         # Put the request back to the waiting queue.
+        self._mark_running_removed_by_model(request)
         self.waiting.prepend_request(request)
+        self._mark_waiting_added_by_model(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1630,9 +1681,14 @@ class Scheduler(SchedulerInterface):
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
+            for request in stopped_running_reqs:
+                self._mark_running_removed_by_model(request)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
+            for request in stopped_preempted_reqs:
+                self._mark_waiting_removed_by_model(request)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -1729,6 +1785,7 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+        self._mark_waiting_added_by_model(request)
 
     def _is_embed_gate_blocked_without_state_change(self,
                                                     request: Request) -> bool:
@@ -1736,11 +1793,12 @@ class Scheduler(SchedulerInterface):
         if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
             return False
 
-        running_decode, running_embed = self._count_running_by_model()
-        waiting_decode_total = (
-            self._count_queue_by_model(self.waiting)[0]
-            + self._count_queue_by_model(self.skipped_waiting)[0]
-        )
+        if not self._embed_waiting_gate_enabled(dual_cfg):
+            return False
+
+        running_decode = self._num_running_decode_reqs
+        running_embed = self._num_running_embed_reqs
+        waiting_decode_total = self._num_waiting_decode_reqs
 
         if (dual_cfg.max_embed_running_reqs is not None
                 and running_embed >= dual_cfg.max_embed_running_reqs):
@@ -1762,8 +1820,7 @@ class Scheduler(SchedulerInterface):
 
         if (dual_cfg.decode_running_reserve is not None
                 and running_decode < dual_cfg.decode_running_reserve
-                and (self._has_waiting_decode_request(self.waiting)
-                     or self._has_waiting_decode_request(self.skipped_waiting))):
+                and waiting_decode_total > 0):
             return True
 
         return False
@@ -2002,9 +2059,13 @@ class Scheduler(SchedulerInterface):
         # Remove all requests from queues at once for better efficiency
         if running_requests_to_remove:
             self.running = remove_all(self.running, running_requests_to_remove)
+            for request in running_requests_to_remove:
+                self._mark_running_removed_by_model(request)
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            for request in waiting_requests_to_remove:
+                self._mark_waiting_removed_by_model(request)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -2166,12 +2227,6 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats.data if kv_connector_stats else None
         )
         running_decode, running_embed = self._count_running_by_model()
-        waiting_decode_main, waiting_embed_main = self._count_queue_by_model(
-            self.waiting
-        )
-        waiting_decode_skipped, waiting_embed_skipped = self._count_queue_by_model(
-            self.skipped_waiting
-        )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
@@ -2183,8 +2238,8 @@ class Scheduler(SchedulerInterface):
             total_num_scheduled_embed_tokens=total_num_scheduled_embed_tokens,
             num_running_decode_reqs=running_decode,
             num_running_embed_reqs=running_embed,
-            num_waiting_decode_reqs=waiting_decode_main + waiting_decode_skipped,
-            num_waiting_embed_reqs=waiting_embed_main + waiting_embed_skipped,
+            num_waiting_decode_reqs=self._num_waiting_decode_reqs,
+            num_waiting_embed_reqs=self._num_waiting_embed_reqs,
             kv_cache_usage=self.kv_cache_manager.usage,
             encoder_cache_usage=self._get_encoder_cache_usage(),
             prefix_cache_stats=prefix_cache_stats,

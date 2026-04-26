@@ -54,3 +54,65 @@ def test_dual_model_embed_requests_allocate_and_free_kv(monkeypatch):
 
     scheduler.finish_requests(decode_request.request_id, RequestStatus.FINISHED_ABORTED)
     assert free_mock.call_count == 2
+
+
+def test_dual_model_without_embed_gate_does_not_scan_model_counts(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=32)
+    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+
+    decode_request = create_requests(num_requests=1, num_tokens=8)[0]
+    embed_request = Request(
+        request_id="embed-0",
+        prompt_token_ids=[7] * 8,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+    scheduler.add_request(decode_request)
+    scheduler.add_request(embed_request)
+
+    scheduler._count_running_by_model = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("unexpected running model-count scan")
+    )
+    scheduler._count_queue_by_model = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("unexpected waiting model-count scan")
+    )
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[decode_request.request_id] == 8
+    assert output.num_scheduled_tokens[embed_request.request_id] == 8
+
+
+def test_dual_model_embed_gate_uses_cached_model_counts(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=32)
+    scheduler.dual_model_config = DualModelConfig(
+        embed_model="embed-model",
+        embed_release_when_decode_waiting_drained=True,
+    )
+
+    decode_requests = create_requests(num_requests=2, num_tokens=8)
+    embed_request = Request(
+        request_id="embed-0",
+        prompt_token_ids=[7] * 8,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+    scheduler.add_request(decode_requests[0])
+    scheduler.add_request(embed_request)
+    scheduler.add_request(decode_requests[1])
+
+    scheduler._count_running_by_model = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("unexpected running model-count scan")
+    )
+    scheduler._count_queue_by_model = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("unexpected waiting model-count scan")
+    )
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        decode_requests[0].request_id: 8,
+        decode_requests[1].request_id: 8,
+    }
