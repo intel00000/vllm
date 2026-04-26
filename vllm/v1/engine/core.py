@@ -16,6 +16,7 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 import vllm.envs as envs
@@ -72,12 +73,29 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.utils import compute_iteration_details, record_function_or_nullcontext
+from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
+
+
+@contextmanager
+def engine_core_nvtx_range(name: str) -> Generator[None, None, None]:
+    if os.environ.get("HB_ENGINE_CORE_NVTX_RANGES", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -386,29 +404,29 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        with record_function_or_nullcontext("engine_core: schedule"):
+        with engine_core_nvtx_range("engine_core: schedule"):
             scheduler_output = self.scheduler.schedule()
-        with record_function_or_nullcontext("engine_core: execute_model_submit"):
+        with engine_core_nvtx_range("engine_core: execute_model_submit"):
             future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
-        with record_function_or_nullcontext("engine_core: grammar_bitmask"):
+        with engine_core_nvtx_range("engine_core: grammar_bitmask"):
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
-            with record_function_or_nullcontext("engine_core: execute_model_result"):
+            with engine_core_nvtx_range("engine_core: execute_model_result"):
                 model_output = future.result()
             if model_output is None:
-                with record_function_or_nullcontext("engine_core: sample_tokens"):
+                with engine_core_nvtx_range("engine_core: sample_tokens"):
                     model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
-        with record_function_or_nullcontext("engine_core: process_aborts"):
+        with engine_core_nvtx_range("engine_core: process_aborts"):
             self._process_aborts_queue()
-        with record_function_or_nullcontext("engine_core: update_from_output"):
+        with engine_core_nvtx_range("engine_core: update_from_output"):
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )
