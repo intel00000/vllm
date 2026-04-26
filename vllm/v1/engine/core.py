@@ -72,7 +72,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.utils import compute_iteration_details
+from vllm.v1.utils import compute_iteration_details, record_function_or_nullcontext
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -386,23 +386,32 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        with record_function_or_nullcontext("engine_core: schedule"):
+            scheduler_output = self.scheduler.schedule()
+        with record_function_or_nullcontext("engine_core: execute_model_submit"):
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+        with record_function_or_nullcontext("engine_core: grammar_bitmask"):
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
-            model_output = future.result()
+            with record_function_or_nullcontext("engine_core: execute_model_result"):
+                model_output = future.result()
             if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+                with record_function_or_nullcontext("engine_core: sample_tokens"):
+                    model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        with record_function_or_nullcontext("engine_core: process_aborts"):
+            self._process_aborts_queue()
+        with record_function_or_nullcontext("engine_core: update_from_output"):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
