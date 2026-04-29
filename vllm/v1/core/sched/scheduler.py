@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -181,6 +182,16 @@ class Scheduler(SchedulerInterface):
         self._embed_wait_drained_phase_started = False
         self._embed_wait_drained_phase_released = False
 
+        # Per-step decision log. Enabled by HB_SCHEDULER_DECISION_LOG=1.
+        # Records each request's admit/defer/skip/preempt reason so we can
+        # explain batching choices alongside per-model counts in
+        # SchedulerStats. No-op when disabled.
+        self._decision_log_enabled = os.environ.get(
+            "HB_SCHEDULER_DECISION_LOG", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._decision_step: int = 0
+        self._decisions: list[tuple[str, str, int]] = []
+
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
         # requests so that they can free the cached states for those requests.
@@ -315,9 +326,7 @@ class Scheduler(SchedulerInterface):
         request_id: str,
         allow_none: bool = False,
     ) -> tuple[list[int], ...] | None:
-        return self._get_request_blocks(request_id).get_block_ids(
-            allow_none=allow_none
-        )
+        return self._get_request_blocks(request_id).get_block_ids(allow_none=allow_none)
 
     def _get_num_common_prefix_blocks(self) -> list[int]:
         if not self.running:
@@ -384,6 +393,54 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _log_decision(self, req_id: str, reason: str, num_tokens: int = 0) -> None:
+        """Record a per-request scheduling decision (admit/defer/skip/preempt).
+
+        No-op unless HB_SCHEDULER_DECISION_LOG=1. Complementary to
+        SchedulerStats per-model counts: counts answer
+        "what got scheduled?", reasons answer "why was X deferred?".
+        """
+        if self._decision_log_enabled:
+            self._decisions.append((req_id, reason, num_tokens))
+
+    def _flush_decision_log(self, *, budget_remaining: int, budget_total: int) -> None:
+        if not self._decision_log_enabled:
+            return
+        buckets: dict[str, list[str]] = defaultdict(list)
+        for req_id, reason, n in self._decisions:
+            label = f"{req_id}:{reason}"
+            if n > 0:
+                label = f"{label}:{n}"
+            head = reason.split("_", 1)[0]
+            buckets[head].append(label)
+
+        # Per-model breakdown is only populated when dual_model_config is set
+        # To avoid emitting misleading `decode=0/0 embed=0/0` on vanilla runs.
+        if self.dual_model_config is not None:
+            model_breakdown = (
+                f" decode={self._num_running_decode_reqs}/"
+                f"{self._num_waiting_decode_reqs} "
+                f"embed={self._num_running_embed_reqs}/"
+                f"{self._num_waiting_embed_reqs}"
+            )
+        else:
+            model_breakdown = ""
+
+        logger.info(
+            "[sched step=%d budget=%d/%d running=%d waiting=%d%s] "
+            "admit=%s defer=%s skip=%s preempt=%s",
+            self._decision_step,
+            budget_total - budget_remaining,
+            budget_total,
+            len(self.running),
+            len(self.waiting) + len(self.skipped_waiting),
+            model_breakdown,
+            buckets.get("ADMIT") or "[]",
+            buckets.get("DEFER") or "[]",
+            buckets.get("SKIP") or "[]",
+            buckets.get("PREEMPTED") or "[]",
+        )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -407,6 +464,11 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+
+        if self._decision_log_enabled:
+            self._decision_step += 1
+            self._decisions = []
+            _decision_initial_budget = token_budget
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -437,6 +499,7 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                self._log_decision(request.request_id, "SKIP_ASYNC_DONE")
                 req_index += 1
                 continue
 
@@ -493,6 +556,7 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                self._log_decision(request.request_id, "SKIP_NO_NEW_TOKENS")
                 req_index += 1
                 continue
 
@@ -525,13 +589,9 @@ class Scheduler(SchedulerInterface):
                                     preempted_req_id
                                 )
                                 req_to_new_blocks.pop(preempted_req_id)
-                                scheduled_spec_decode_tokens.pop(
+                                scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                                preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                     preempted_req_id, None
-                                )
-                                preempted_encoder_inputs = (
-                                    scheduled_encoder_inputs.pop(
-                                        preempted_req_id, None
-                                    )
                                 )
                                 if preempted_encoder_inputs:
                                     # Restore encoder compute budget if the
@@ -547,6 +607,9 @@ class Scheduler(SchedulerInterface):
                             preempted_req = self.running.pop()
 
                         self._preempt_request(preempted_req, scheduled_timestamp)
+                        self._log_decision(
+                            preempted_req.request_id, "PREEMPTED_KV_FULL"
+                        )
                         preempted_reqs.append(preempted_req)
                         if preempted_req == request:
                             # No more request to preempt. Cannot schedule this
@@ -557,6 +620,7 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                self._log_decision(request.request_id, "DEFER_KV_FULL")
                 break
 
             # Schedule the request.
@@ -566,6 +630,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            self._log_decision(request_id, "ADMIT_RUNNING", num_new_tokens)
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -616,6 +681,7 @@ class Scheduler(SchedulerInterface):
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    self._log_decision("-", "DEFER_CAPACITY")
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -627,6 +693,7 @@ class Scheduler(SchedulerInterface):
                 request_uses_kv_cache = self._request_uses_kv_cache(request)
 
                 if self._should_skip_embed_waiting_request(request):
+                    self._log_decision(request_id, "DEFER_EMBED_GATE")
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -640,6 +707,7 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                    self._log_decision(request_id, "DEFER_BLOCKED_STATUS")
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -655,6 +723,7 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    self._log_decision(request_id, "DEFER_LORA_LIMIT")
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -683,6 +752,7 @@ class Scheduler(SchedulerInterface):
                                 # The request cannot be scheduled because
                                 # the KVConnector couldn't determine
                                 # the number of matched tokens.
+                                self._log_decision(request_id, "DEFER_CONNECTOR")
                                 request_queue.pop_request()
                                 step_skipped_waiting.prepend_request(request)
                                 continue
@@ -693,14 +763,11 @@ class Scheduler(SchedulerInterface):
                             connector_prefix_cache_queries = (
                                 request.num_tokens - num_new_local_computed_tokens
                             )
-                            connector_prefix_cache_hits = (
-                                num_external_computed_tokens
-                            )
+                            connector_prefix_cache_hits = num_external_computed_tokens
 
                         # Total computed tokens (local + external).
                         num_computed_tokens = (
-                            num_new_local_computed_tokens
-                            + num_external_computed_tokens
+                            num_new_local_computed_tokens + num_external_computed_tokens
                         )
                         assert num_computed_tokens <= request.num_tokens
                     else:
@@ -742,6 +809,7 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        self._log_decision(request_id, "DEFER_BUDGET", num_new_tokens)
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -870,8 +938,10 @@ class Scheduler(SchedulerInterface):
                     )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    self._log_decision(request_id, "ADMIT_PREFILL", num_new_tokens)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    self._log_decision(request_id, "ADMIT_RESUMED", num_new_tokens)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -998,6 +1068,13 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        if self._decision_log_enabled:
+            self._flush_decision_log(
+                budget_remaining=token_budget,
+                budget_total=_decision_initial_budget,
+            )
+
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1144,9 +1221,7 @@ class Scheduler(SchedulerInterface):
         if (
             dual_cfg.decode_running_reserve is not None
             and running_decode < dual_cfg.decode_running_reserve
-            and (
-                waiting_decode_total > 0
-            )
+            and (waiting_decode_total > 0)
         ):
             return True
 
@@ -1748,7 +1823,8 @@ class Scheduler(SchedulerInterface):
             finished_req_ids.clear()
 
         scheduled_by_model = self._count_scheduled_by_model(
-            scheduler_output.num_scheduled_tokens)
+            scheduler_output.num_scheduled_tokens
+        )
         if (
             stats := self.make_stats(
                 num_scheduled_reqs=len(scheduler_output.num_scheduled_tokens),
@@ -1787,8 +1863,7 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
         self._mark_waiting_added_by_model(request)
 
-    def _is_embed_gate_blocked_without_state_change(self,
-                                                    request: Request) -> bool:
+    def _is_embed_gate_blocked_without_state_change(self, request: Request) -> bool:
         dual_cfg = self.dual_model_config
         if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
             return False
@@ -1800,27 +1875,31 @@ class Scheduler(SchedulerInterface):
         running_embed = self._num_running_embed_reqs
         waiting_decode_total = self._num_waiting_decode_reqs
 
-        if (dual_cfg.max_embed_running_reqs is not None
-                and running_embed >= dual_cfg.max_embed_running_reqs):
+        if (
+            dual_cfg.max_embed_running_reqs is not None
+            and running_embed >= dual_cfg.max_embed_running_reqs
+        ):
             return True
 
         if dual_cfg.embed_release_when_decode_waiting_drained:
             if waiting_decode_total > 0:
                 return True
-            if (not self._embed_wait_drained_phase_started
-                    and running_decode > 0):
+            if not self._embed_wait_drained_phase_started and running_decode > 0:
                 return True
             if not self._embed_wait_drained_phase_released:
                 return False
 
-        if (dual_cfg.embed_release_running_decode_threshold is not None
-                and running_decode
-                > dual_cfg.embed_release_running_decode_threshold):
+        if (
+            dual_cfg.embed_release_running_decode_threshold is not None
+            and running_decode > dual_cfg.embed_release_running_decode_threshold
+        ):
             return True
 
-        if (dual_cfg.decode_running_reserve is not None
-                and running_decode < dual_cfg.decode_running_reserve
-                and waiting_decode_total > 0):
+        if (
+            dual_cfg.decode_running_reserve is not None
+            and running_decode < dual_cfg.decode_running_reserve
+            and waiting_decode_total > 0
+        ):
             return True
 
         return False

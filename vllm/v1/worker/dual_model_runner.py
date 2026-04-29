@@ -44,6 +44,15 @@ def _nvtx_range(name: str):
 def _temporary_async_outputs(runner: GPUModelRunner, enabled: bool):
     old_value = runner.use_async_scheduling
     if enabled:
+        # Lazy-init the async copy stream + prepare_inputs event. GPUModelRunner
+        # only creates these at __init__ when scheduler_config.async_scheduling
+        # is True, but DualModelRunner forces that off (no async scheduler), so
+        # they're None here. Without this, AsyncGPUModelRunnerOutput.__init__
+        # crashes on `with torch.cuda.stream(None):`.
+        if runner.async_output_copy_stream is None:
+            runner.async_output_copy_stream = torch.cuda.Stream()
+        if runner.prepare_inputs_event is None:
+            runner.prepare_inputs_event = torch.Event()
         runner.use_async_scheduling = True
     try:
         yield
@@ -93,9 +102,7 @@ class DualModelRunner:
                 f"'default_stream', got {stream_mode!r}."
             )
 
-        execute_order = os.environ.get(
-            "VLLM_DUAL_MODEL_EXECUTE_ORDER", "decode_first"
-        )
+        execute_order = os.environ.get("VLLM_DUAL_MODEL_EXECUTE_ORDER", "decode_first")
         if execute_order not in ("decode_first", "embed_first"):
             raise ValueError(
                 "VLLM_DUAL_MODEL_EXECUTE_ORDER must be 'decode_first' or "
@@ -283,8 +290,7 @@ class DualModelRunner:
                 f"{sorted(overlap)[:4]}"
             )
         self.model_memory_usage = (
-            self.decode_runner.model_memory_usage
-            + self.embed_runner.model_memory_usage
+            self.decode_runner.model_memory_usage + self.embed_runner.model_memory_usage
         )
         self.model = self.decode_runner.model
 
@@ -327,10 +333,7 @@ class DualModelRunner:
         )
 
     def capture_model(self) -> int:
-        return (
-            self.decode_runner.capture_model()
-            + self.embed_runner.capture_model()
-        )
+        return self.decode_runner.capture_model() + self.embed_runner.capture_model()
 
     def _dummy_run(self, *args, **kwargs):
         return self.decode_runner._dummy_run(*args, **kwargs)
@@ -406,8 +409,8 @@ class DualModelRunner:
             if has_embed_work:
                 embed_exec_output = run_embed()
 
-        decode_needs_sample = (
-            decode_output is None and bool(split_outputs.decode.num_scheduled_tokens)
+        decode_needs_sample = decode_output is None and bool(
+            split_outputs.decode.num_scheduled_tokens
         )
         if decode_needs_sample:
             self.pending_embed_output = embed_exec_output

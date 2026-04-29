@@ -161,7 +161,22 @@ class Worker(WorkerBase):
         self._work_stream_id = int(os.environ.get("VLLM_WORK_STREAM_ID", "0"))
         self._work_stream: torch.cuda.Stream | None = None
 
-        # Monotonic scheduler step counter for NVTX annotation.
+        # Optional role label prefixed onto NVTX annotations so two workers
+        # running in the same process (e.g. gen+embed overlap) produce visually
+        # distinguishable timeline tags. Naming follows Theo's HB_* family.
+        self._work_role = os.environ.get("HB_WORK_ROLE", "")
+
+        # Whether to emit per-step NVTX annotations from annotate_profile()
+        # even when start_profile() has not been called. Needed when a
+        # secondary worker doesn't own cudaProfilerStart/Stop but still wants
+        # timeline tags. Off by default to match upstream behavior.
+        self._emit_step_nvtx = os.environ.get(
+            "HB_GPU_WORKER_NVTX_RANGES", "0"
+        ).lower() in ("1", "true", "yes", "on")
+
+        # Monotonic scheduler step counter for NVTX annotation. Reset to 0
+        # by profile(is_start=True) so step_1 aligns with the first
+        # captured step.
         self._sched_step: int = 0
 
     def _work_stream_context(self) -> AbstractContextManager:
@@ -757,14 +772,13 @@ class Worker(WorkerBase):
         if self.profiler:
             self.profiler.step()
 
-        # Determine whether we should emit NVTX annotations.  We annotate
-        # when the profiler is running (normal path) OR when a profiler_config
-        # is present even though start_profile() hasn't been called yet.  The
-        # second case supports overlap scenarios where a secondary model needs
-        # visible NVTX tags without owning the cudaProfilerStart/Stop
-        # lifecycle.
+        # Emit NVTX when the profiler is running (normal path) OR when the
+        # secondary-worker fallback is explicitly enabled via
+        # HB_GPU_WORKER_NVTX_RANGES (overlap scenario where this worker doesn't
+        # own cudaProfilerStart/Stop but still needs timeline tags).
         profiler_type = self.profiler_config.profiler if self.profiler_config else None
-        if not self.profiler and profiler_type is None:
+        emit_fallback = self._emit_step_nvtx and profiler_type is not None
+        if not self.profiler and not emit_fallback:
             return nullcontext()
 
         iteration_details = compute_iteration_details(scheduler_output)
@@ -773,28 +787,31 @@ class Worker(WorkerBase):
 
         _LONG_SEQ_THRESHOLD = 32768
         _max_seq = iteration_details.max_seq_tokens
-        parts = [
-            "step_",
-            str(self._sched_step),
-            "_execute_context_",
-            str(iteration_details.num_ctx_requests),
-            "(",
-            str(iteration_details.num_ctx_tokens),
-            ")_generation_",
-            str(iteration_details.num_generation_requests),
-            "(",
-            str(iteration_details.num_generation_tokens),
-            ")_maxseq_",
-            str(_max_seq),
-        ]
+        parts: list[str] = []
+        if self._work_role:
+            parts.extend([self._work_role, "_"])
+        parts.extend(
+            [
+                "step_",
+                str(self._sched_step),
+                "_execute_context_",
+                str(iteration_details.num_ctx_requests),
+                "(",
+                str(iteration_details.num_ctx_tokens),
+                ")_generation_",
+                str(iteration_details.num_generation_requests),
+                "(",
+                str(iteration_details.num_generation_tokens),
+                ")_maxseq_",
+                str(_max_seq),
+            ]
+        )
         if _max_seq > _LONG_SEQ_THRESHOLD:
             parts.append("_LONG")
         annotation = "".join(parts)
 
         if self.profiler:
             return self.profiler.annotate_context_manager(annotation)
-        # Fallback: profiler_config is set but start_profile() wasn't called.
-        # Emit NVTX directly so the annotation is visible in nsys.
         return torch.cuda.nvtx.range(annotation)
 
     @torch.inference_mode()
@@ -912,6 +929,10 @@ class Worker(WorkerBase):
             )
 
         if is_start:
+            # Reset NVTX step counter so step_1 aligns with the first
+            # captured scheduler step.
+            self._sched_step = 0
+
             # Generate the trace name by combining prefix with comprehensive rank suffix
             from vllm.distributed.utils import get_worker_rank_suffix
 
