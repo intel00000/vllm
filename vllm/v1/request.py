@@ -19,6 +19,7 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+    infer_model_id,
 )
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
@@ -77,12 +78,16 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        model_id: str | None = None,
+        parent_request_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
+        self.model_id = infer_model_id(sampling_params, pooling_params, model_id)
+        self.parent_request_id = parent_request_id
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
@@ -239,6 +244,8 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            model_id=request.model_id,
+            parent_request_id=request.parent_request_id,
         )
 
     def append_output_token_ids(

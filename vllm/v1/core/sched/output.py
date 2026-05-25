@@ -41,6 +41,11 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    # Per-request routing key for dual-model scheduling. Defaults to
+    # "decode" so single-model paths and existing keyword-only call sites
+    # stay valid; the scheduler/worker only consult this when a
+    # DualModelConfig is active.
+    model_id: str = "decode"
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -63,6 +68,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            model_id=request.model_id,
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -73,6 +79,7 @@ class NewRequestData:
         return (
             f"NewRequestData("
             f"req_id={self.req_id},"
+            f"model_id={self.model_id},"
             f"prompt_token_ids={self.prompt_token_ids},"
             f"prefill_token_ids={self.prefill_token_ids},"
             f"mm_features={self.mm_features},"
@@ -98,6 +105,7 @@ class NewRequestData:
         return (
             f"NewRequestData("
             f"req_id={self.req_id},"
+            f"model_id={self.model_id},"
             f"prompt_token_ids_len={prompt_token_ids_len},"
             f"prefill_token_ids_len={prefill_token_ids_len},"
             f"mm_features={self.mm_features},"
