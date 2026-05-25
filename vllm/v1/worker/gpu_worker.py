@@ -71,6 +71,39 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _select_model_runner_class(
+    vllm_config: VllmConfig, use_v2_model_runner: bool
+) -> type:
+    """Pick the model-runner class for this worker.
+
+    Precedence:
+        1. DualModelRunner when additional_config['dual_model'] is set.
+        2. V2 GPUModelRunner when VLLM_USE_V2_MODEL_RUNNER=1.
+        3. Legacy V1 GPUModelRunner.
+
+    Imports are local so that single-model paths don't pay the cost
+    of importing dual_model_runner (which pulls in flashinfer at module
+    scope via the green-ctx helper).
+    """
+    from vllm.v1.worker.dual_model_helpers import DualModelConfig
+
+    if DualModelConfig.from_vllm_config(vllm_config) is not None:
+        from vllm.v1.worker.dual_model_runner import DualModelRunner
+
+        return DualModelRunner
+    if use_v2_model_runner:
+        from vllm.v1.worker.gpu.model_runner import (
+            GPUModelRunner as GPUModelRunnerV2,
+        )
+
+        return GPUModelRunnerV2
+    from vllm.v1.worker.gpu_model_runner import (
+        GPUModelRunner as GPUModelRunnerV1,
+    )
+
+    return GPUModelRunnerV1
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -312,22 +345,14 @@ class Worker(WorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        # Construct the model runner
-        if self.use_v2_model_runner:
-            from vllm.v1.worker.gpu.model_runner import (
-                GPUModelRunner as GPUModelRunnerV2,
-            )
-
-            # HACK(woosuk): This is a temporary fix to avoid type errors.
-            self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
-                self.vllm_config, self.device
-            )
-        else:
-            from vllm.v1.worker.gpu_model_runner import (
-                GPUModelRunner as GPUModelRunnerV1,
-            )
-
-            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+        # Construct the model runner -- picks DualModelRunner when
+        # additional_config['dual_model'] is set, else V2/V1 per env.
+        runner_cls = _select_model_runner_class(
+            self.vllm_config, self.use_v2_model_runner
+        )
+        self.model_runner: GPUModelRunner = runner_cls(  # type: ignore
+            self.vllm_config, self.device
+        )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
