@@ -28,28 +28,69 @@ class DualModelConfig:
     embed_dtype: str | None = None
     embed_max_model_len: int | None = None
     embed_enforce_eager: bool | None = None
+    # When None, embed inherits enable_chunked_prefill from the gen
+    # scheduler_config. Set True/False to override only the embed side
+    # without touching the gen knob. Lets us A/B chunked prefill per
+    # model -- see notes/chunked_prefill_investigation.md for the
+    # experiment plan.
+    embed_enable_chunked_prefill: bool | None = None
+
+    # --- Admission gates (consumed by Scheduler in a later commit) -------
+    # Acronyms used throughout the dual-model code and commit messages:
+    #   DRR      = decode_running_reserve              (floor on running
+    #              decode count before admitting any embed)
+    #   MER      = max_embed_running_reqs              (hard cap on running
+    #              embed concurrency)
+    #   EPT      = max_embed_prefill_tokens_per_step   (per-step embed
+    #              prefill token budget)
+    #   NDP      = enforce_no_double_prefill           (at most one of
+    #              {decode-prefill, embed-prefill} admitted per step)
+    #   pair-dep = enforce_pair_dependency             (child decode req
+    #              with parent_request_id waits until parent embed done)
+    # All gates are opt-in. None / False = single-model legacy behaviour.
+    # ---------------------------------------------------------------------
+
+    # DRR: floor on running decode count -- defer embed admissions from
+    # the waiting queue until at least N decode reqs are already running.
+    # Prevents embed flood from starving decode.
     decode_running_reserve: int | None = None
+
+    # MER: hard ceiling on concurrently running embed reqs.
     max_embed_running_reqs: int | None = None
+
+    # Auxiliary embed-release knobs (alternative DRR phasings):
+    #   embed_release_running_decode_threshold: open embed admission once
+    #     running_decode hits this number (different shape than DRR).
+    #   embed_release_when_decode_waiting_drained: open embed admission
+    #     once the decode waiting queue has been fully drained.
     embed_release_running_decode_threshold: int | None = None
     embed_release_when_decode_waiting_drained: bool = False
-    # Per-step token caps split into three buckets. Each request's token cost
-    # is counted against exactly one bucket per scheduler step:
+
+    # EPT family: per-step token caps split into three buckets. Each
+    # request's token cost is counted against exactly one bucket per
+    # scheduler step:
     #   - decode_prefill: model_id == decode and num_output_tokens == 0
     #   - decode_loop:    model_id == decode and num_output_tokens > 0
-    #   - embed_prefill:  model_id == embed (always prefill — pool is one step)
+    #   - embed_prefill:  model_id == embed (always prefill -- pool is one step)
     # When a bucket cap is reached, additional requests of that bucket are
-    # deferred to a later step even if the global max_num_batched_tokens has
-    # room. None = no cap (legacy behaviour).
+    # deferred to a later step even if the global max_num_batched_tokens
+    # has room. None = no cap (legacy behaviour).
+    # max_embed_prefill_tokens_per_step is the canonical "EPT" referenced
+    # in commit messages and docs.
     max_decode_prefill_tokens_per_step: int | None = None
     max_decode_loop_tokens_per_step: int | None = None
     max_embed_prefill_tokens_per_step: int | None = None
 
-    # RAG-style scheduling.
-    #   enforce_pair_dependency: hold decode requests with a parent_request_id
-    #     out of the waiting queue until the parent embed has finished.
-    #   enforce_no_double_prefill: per-step admission gate — do not admit a
-    #     new embed-prefill if a decode-prefill has already been admitted (or
-    #     is carry-over running) this step, and vice versa.
+    # RAG-style scheduling gates.
+    #   pair-dep (enforce_pair_dependency): hold decode requests with a
+    #     parent_request_id out of the waiting queue until the parent
+    #     embed request has finished. Models the embed -> decode data
+    #     dependency in retrieval pipelines.
+    #   NDP (enforce_no_double_prefill): per-step admission gate -- do
+    #     not admit a new embed-prefill if a decode-prefill has already
+    #     been admitted (or is carry-over running) this step, and vice
+    #     versa. Prevents two compute-bound prefill kernels from
+    #     contending on the same step across the dual streams.
     enforce_pair_dependency: bool = False
     enforce_no_double_prefill: bool = False
 
@@ -85,6 +126,9 @@ class DualModelConfig:
             embed_dtype=raw_cfg.get("embed_dtype"),
             embed_max_model_len=raw_cfg.get("embed_max_model_len"),
             embed_enforce_eager=raw_cfg.get("embed_enforce_eager"),
+            embed_enable_chunked_prefill=raw_cfg.get(
+                "embed_enable_chunked_prefill"
+            ),
             decode_running_reserve=raw_cfg.get("decode_running_reserve"),
             max_embed_running_reqs=raw_cfg.get("max_embed_running_reqs"),
             embed_release_running_decode_threshold=raw_cfg.get(

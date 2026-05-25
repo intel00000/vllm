@@ -54,6 +54,7 @@ def test_from_vllm_config_parses_populated_dict():
                 "enforce_no_double_prefill": True,
                 "embed_release_when_decode_waiting_drained": True,
                 "kv_pressure_skip_threshold": 0.9,
+                "embed_enable_chunked_prefill": False,
             }
         }
     )
@@ -67,6 +68,13 @@ def test_from_vllm_config_parses_populated_dict():
     assert cfg.enforce_no_double_prefill is True
     assert cfg.embed_release_when_decode_waiting_drained is True
     assert cfg.kv_pressure_skip_threshold == 0.9
+    assert cfg.embed_enable_chunked_prefill is False
+
+
+def test_embed_enable_chunked_prefill_defaults_to_none():
+    """None means 'inherit gen scheduler_config.enable_chunked_prefill'."""
+    cfg = DualModelConfig(embed_model="some/embed-model")
+    assert cfg.embed_enable_chunked_prefill is None
 
 
 def test_from_vllm_config_returns_none_when_additional_config_missing():
