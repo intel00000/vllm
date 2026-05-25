@@ -261,7 +261,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
 
-    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+    def load_model(
+        self,
+        load_dummy_weights: bool = False,
+        *args,
+        prefix: str = "",
+        **kwargs,
+    ) -> None:
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
@@ -272,7 +278,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.info("Loading model from scratch...")
 
             self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.vllm_config.model_config
+                vllm_config=self.vllm_config,
+                model_config=self.vllm_config.model_config,
+                prefix=prefix,
             )
             if self.lora_config:
                 self.model = self.load_lora_model(
