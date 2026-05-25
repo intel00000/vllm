@@ -64,6 +64,24 @@ class FinishReason(enum.IntEnum):
         return FINISH_REASON_STRINGS[self.value]
 
 
+def infer_model_id(
+    sampling_params: SamplingParams | None,
+    pooling_params: PoolingParams | None,
+    explicit_model_id: str | None = None,
+) -> str:
+    """Infer the per-request model_id used for dual-model routing.
+
+    Returns the explicit override if provided; otherwise "decode" for
+    sampling requests and the pooling task name for pooling requests.
+    """
+    if explicit_model_id is not None:
+        return explicit_model_id
+    if sampling_params is not None:
+        return "decode"
+    assert pooling_params is not None
+    return pooling_params.task
+
+
 @dataclass
 class EngineCoreReadyResponse:
     """Sent from EngineCore to each frontend at the end of engine startup.
@@ -109,6 +127,14 @@ class EngineCoreRequest(
     # a wave finished notification is received.
     current_wave: int = 0
     priority: int = 0
+    model_id: str | None = None
+
+    # Optional dependency: this request becomes eligible for scheduling only
+    # after the parent request (referenced by request_id) has finished. Used
+    # for RAG-style pipelines (paired embed+decode). The scheduler enforces
+    # the gate when DualModelConfig.enforce_pair_dependency is set; otherwise
+    # this field is informational only.
+    parent_request_id: str | None = None
 
     trace_headers: Mapping[str, str] | None = None
     resumable: bool = False
@@ -135,6 +161,14 @@ class EngineCoreRequest(
             return self.sampling_params
         assert self.pooling_params is not None
         return self.pooling_params
+
+    @property
+    def resolved_model_id(self) -> str:
+        return infer_model_id(
+            self.sampling_params,
+            self.pooling_params,
+            self.model_id,
+        )
 
 
 class EngineCoreEventType(enum.IntEnum):
