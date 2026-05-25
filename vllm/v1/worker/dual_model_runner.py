@@ -381,11 +381,18 @@ class DualModelRunner:
             model_weights="",
             hf_config_path=None,
         )
-        embed_scheduler_config = self._replace_dataclass(
-            embed_vllm_config.scheduler_config,
+        scheduler_overrides: dict[str, Any] = dict(
             max_model_len=embed_model_config.max_model_len,
             is_encoder_decoder=embed_model_config.is_encoder_decoder,
             runner_type="pooling",
+        )
+        if dual_cfg.embed_enable_chunked_prefill is not None:
+            scheduler_overrides["enable_chunked_prefill"] = (
+                dual_cfg.embed_enable_chunked_prefill
+            )
+        embed_scheduler_config = self._replace_dataclass(
+            embed_vllm_config.scheduler_config,
+            **scheduler_overrides,
         )
         embed_vllm_config.model_config = embed_model_config
         embed_vllm_config.scheduler_config = embed_scheduler_config

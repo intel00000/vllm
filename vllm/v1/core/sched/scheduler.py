@@ -55,6 +55,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.dual_model_helpers import DualModelConfig
 
 logger = init_logger(__name__)
 
@@ -75,6 +76,7 @@ class Scheduler(SchedulerInterface):
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
+        self.dual_model_config = DualModelConfig.from_vllm_config(vllm_config)
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -120,6 +122,11 @@ class Scheduler(SchedulerInterface):
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
             )
+            if self.dual_model_config is not None:
+                raise ValueError(
+                    "Experimental dual-model scheduling does not support KV "
+                    "transfer connectors yet."
+                )
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
@@ -163,6 +170,14 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # Dual-model per-model counters. Maintained in lockstep with
+        # self.waiting / self.skipped_waiting / self.running via
+        # _mark_*_by_model hooks. Zero when dual_model_config is None.
+        self._num_running_decode_reqs = 0
+        self._num_running_embed_reqs = 0
+        self._num_waiting_decode_reqs = 0
+        self._num_waiting_embed_reqs = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -762,7 +777,9 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                self._mark_waiting_removed_by_model(request)
                 self.running.append(request)
+                self._mark_running_added_by_model(request)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -927,7 +944,9 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         # Put the request back to the waiting queue.
+        self._mark_running_removed_by_model(request)
         self.waiting.prepend_request(request)
+        self._mark_waiting_added_by_model(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1438,9 +1457,13 @@ class Scheduler(SchedulerInterface):
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
+            for request in stopped_running_reqs:
+                self._mark_running_removed_by_model(request)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            for request in stopped_preempted_reqs:
+                self._mark_waiting_removed_by_model(request)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -1525,6 +1548,72 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+        self._mark_waiting_added_by_model(request)
+
+    # ------------------------------------------------------------------
+    # Dual-model bookkeeping helpers.
+    #
+    # These are no-ops when dual_model_config is None (single-model path)
+    # so the counters stay at 0 and the scheduler behaves exactly like
+    # upstream.
+    #
+    # The counters maintained here are the substrate for the admission
+    # gates that land in a later commit:
+    #   DRR      = decode_running_reserve              (floor on running
+    #              decode count before admitting any embed)
+    #   MER      = max_embed_running_reqs              (hard cap on running
+    #              embed concurrency)
+    #   EPT      = max_embed_prefill_tokens_per_step   (per-step embed
+    #              prefill token budget)
+    #   NDP      = enforce_no_double_prefill           (at most one of
+    #              {decode-prefill, embed-prefill} admitted per step)
+    #   pair-dep = enforce_pair_dependency             (child decode req
+    #              with parent_request_id waits until parent embed done)
+    # See vllm/v1/worker/dual_model_helpers.py::DualModelConfig for the
+    # canonical field-level documentation.
+    # ------------------------------------------------------------------
+
+    def _dual_model_request_kind(self, request: Request) -> str | None:
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None:
+            return None
+        if request.model_id == dual_cfg.decode_model_id:
+            return "decode"
+        if request.model_id == dual_cfg.embed_model_id:
+            return "embed"
+        return None
+
+    def _mark_waiting_added_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            self._num_waiting_decode_reqs += 1
+        elif kind == "embed":
+            self._num_waiting_embed_reqs += 1
+
+    def _mark_waiting_removed_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            assert self._num_waiting_decode_reqs > 0
+            self._num_waiting_decode_reqs -= 1
+        elif kind == "embed":
+            assert self._num_waiting_embed_reqs > 0
+            self._num_waiting_embed_reqs -= 1
+
+    def _mark_running_added_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            self._num_running_decode_reqs += 1
+        elif kind == "embed":
+            self._num_running_embed_reqs += 1
+
+    def _mark_running_removed_by_model(self, request: Request) -> None:
+        kind = self._dual_model_request_kind(request)
+        if kind == "decode":
+            assert self._num_running_decode_reqs > 0
+            self._num_running_decode_reqs -= 1
+        elif kind == "embed":
+            assert self._num_running_embed_reqs > 0
+            self._num_running_embed_reqs -= 1
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
@@ -1728,9 +1817,13 @@ class Scheduler(SchedulerInterface):
         # Remove all requests from queues at once for better efficiency
         if running_requests_to_remove:
             self.running = remove_all(self.running, running_requests_to_remove)
+            for request in running_requests_to_remove:
+                self._mark_running_removed_by_model(request)
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            for request in waiting_requests_to_remove:
+                self._mark_waiting_removed_by_model(request)
 
         # Second pass: set status and free requests
         for request in valid_requests:
