@@ -201,6 +201,18 @@ class Scheduler(SchedulerInterface):
         self._num_waiting_decode_reqs = 0
         self._num_waiting_embed_reqs = 0
 
+        # RAG pair-dependency state. A child request (typically a decode
+        # whose generation depends on the result of an embed) can carry
+        # parent_request_id pointing at its parent. While the parent is
+        # still in flight, the child is held in _gated_children and NOT
+        # enqueued to self.waiting / self.skipped_waiting (putting them
+        # there would block younger embed-only requests via the FCFS-
+        # priority head). Released in _free_request when the parent
+        # finishes. Empty / inert when enforce_pair_dependency is False.
+        self._gated_children: dict[str, Request] = {}
+        # parent_request_id -> {child_request_id, ...}
+        self._children_of_parent: dict[str, set[str]] = defaultdict(set)
+
         # Per-step decision log. Enabled by HB_SCHEDULER_DECISION_LOG=1.
         # Records each request's admit/defer/skip/preempt reason so we can
         # explain batching choices alongside per-model counts in
@@ -2093,6 +2105,58 @@ class Scheduler(SchedulerInterface):
             assert self._num_running_embed_reqs > 0
             self._num_running_embed_reqs -= 1
 
+    def _should_gate_child_on_parent(self, request: Request) -> bool:
+        """Return True if `request` should be held in _gated_children.
+
+        The gate fires only when:
+          - DualModelConfig.enforce_pair_dependency is True,
+          - the request carries a parent_request_id,
+          - the parent is still tracked in self.requests, AND
+          - the parent has not yet finished.
+
+        If the parent is unknown or already finished, the dependency is
+        considered satisfied and the request falls through to the
+        legacy waiting enqueue.
+        """
+        parent_id = getattr(request, "parent_request_id", None)
+        if parent_id is None:
+            return False
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or not dual_cfg.enforce_pair_dependency:
+            return False
+        parent = self.requests.get(parent_id)
+        if parent is None:
+            return False
+        # Parent could be in any state; if already finished it's already
+        # been / about to be _free_request'd. Treat finished == satisfied.
+        return not parent.is_finished()
+
+    def _release_gated_children(
+        self, parent_id: str, parent_status: RequestStatus
+    ) -> None:
+        """Resolve any children of a just-finished parent.
+
+        If parent finished normally -> children move to self.waiting.
+        If parent was aborted        -> children are aborted too (cascade).
+        """
+        child_ids = self._children_of_parent.pop(parent_id, None)
+        if not child_ids:
+            return
+        cascade_abort = parent_status == RequestStatus.FINISHED_ABORTED
+        for child_id in list(child_ids):
+            child = self._gated_children.pop(child_id, None)
+            if child is None:
+                continue
+            if cascade_abort:
+                child.status = RequestStatus.FINISHED_ABORTED
+                # _free_request will recursively cascade to grandchildren
+                # and remove the child from self.requests via _free_blocks.
+                self._free_request(child)
+                self._log_decision(child_id, "ABORTED_PARENT_ABORTED")
+            else:
+                self._enqueue_waiting_request(child)
+                self._log_decision(child_id, "ADMIT_RELEASED_BY_PARENT")
+
     # ------------------------------------------------------------------
     # Decision log (HB_SCHEDULER_DECISION_LOG=1).
     #
@@ -2313,8 +2377,22 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
-            self.requests[request.request_id] = request
+            # RAG pair-dependency gate: hold child in _gated_children until
+            # parent finishes. Falls through to legacy enqueue if the gate
+            # is disabled, the parent is unknown, or the parent is already
+            # done.
+            if self._should_gate_child_on_parent(request):
+                self._gated_children[request.request_id] = request
+                self._children_of_parent[request.parent_request_id].add(
+                    request.request_id
+                )
+                self.requests[request.request_id] = request
+                self._log_decision(
+                    request.request_id, "GATED_PARENT_PENDING"
+                )
+            else:
+                self._enqueue_waiting_request(request)
+                self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -2409,6 +2487,9 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+
+        # Release any RAG-style children whose parent just finished.
+        self._release_gated_children(request_id, request.status)
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
