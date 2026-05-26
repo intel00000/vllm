@@ -203,13 +203,24 @@ class Scheduler(SchedulerInterface):
         # parent_request_id -> {child_request_id, ...}
         self._children_of_parent: dict[str, set[str]] = defaultdict(set)
 
-        # Per-step decision log. Enabled by HB_SCHEDULER_DECISION_LOG=1.
-        # Records each request's admit/defer/skip/preempt reason so we can
-        # explain batching choices alongside per-model counts in
-        # SchedulerStats. No-op when disabled.
-        self._decision_log_enabled = os.environ.get(
-            "HB_SCHEDULER_DECISION_LOG", "0"
-        ).lower() in ("1", "true", "yes", "on")
+        # Per-step decision log. Tri-state HB_SCHEDULER_DECISION_LOG:
+        #   0 / unset / false : disabled (no-op)
+        #   1 / true / on     : COMPACT -- emit per-reason counts only
+        #   2 / verbose       : VERBOSE -- emit full per-request lists
+        #                       (the original commit-6 format; can be
+        #                       several MB per cell on long runs)
+        # Records each request's admit/defer/skip/preempt reason so we
+        # can explain batching choices alongside per-model counts in
+        # SchedulerStats.
+        _dl_raw = os.environ.get("HB_SCHEDULER_DECISION_LOG", "0").lower()
+        if _dl_raw in ("2", "verbose"):
+            self._decision_log_level = 2
+        elif _dl_raw in ("1", "true", "yes", "on"):
+            self._decision_log_level = 1
+        else:
+            self._decision_log_level = 0
+        # Backward-compat alias used by call-site fast-paths.
+        self._decision_log_enabled = self._decision_log_level > 0
         self._decision_step: int = 0
         self._decisions: list[tuple[str, str, int]] = []
 
@@ -2067,15 +2078,22 @@ class Scheduler(SchedulerInterface):
     def _flush_decision_log(
         self, *, budget_remaining: int, budget_total: int
     ) -> None:
-        if not self._decision_log_enabled:
+        if self._decision_log_level == 0:
             return
-        buckets: dict[str, list[str]] = defaultdict(list)
+
+        # Bucket entries by verb (ADMIT/DEFER/SKIP/PREEMPTED) AND by full
+        # reason for compact-mode reason-counts.
+        verb_to_entries: dict[str, list[str]] = defaultdict(list)
+        verb_to_reason_counts: dict[str, dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
         for req_id, reason, n in self._decisions:
             label = f"{req_id}:{reason}"
             if n > 0:
                 label = f"{label}:{n}"
             head = reason.split("_", 1)[0]
-            buckets[head].append(label)
+            verb_to_entries[head].append(label)
+            verb_to_reason_counts[head][reason] += 1
 
         # Per-model breakdown is only meaningful when dual_model_config
         # is set. Suppress on vanilla single-model runs to avoid
@@ -2090,6 +2108,39 @@ class Scheduler(SchedulerInterface):
         else:
             model_breakdown = ""
 
+        if self._decision_log_level >= 2:
+            # VERBOSE: full per-request lists (original commit-6 format).
+            logger.info(
+                "[sched step=%d budget=%d/%d running=%d waiting=%d%s] "
+                "admit=%s defer=%s skip=%s preempt=%s",
+                self._decision_step,
+                budget_total - budget_remaining,
+                budget_total,
+                len(self.running),
+                len(self.waiting) + len(self.skipped_waiting),
+                model_breakdown,
+                verb_to_entries.get("ADMIT") or "[]",
+                verb_to_entries.get("DEFER") or "[]",
+                verb_to_entries.get("SKIP") or "[]",
+                verb_to_entries.get("PREEMPTED") or "[]",
+            )
+            return
+
+        # COMPACT (level 1): per-verb count + a compact reason summary
+        # for the non-empty defers/skips so we can see WHY without
+        # enumerating every request id.
+        def _verb_summary(verb: str) -> str:
+            total = sum(verb_to_reason_counts.get(verb, {}).values())
+            if total == 0:
+                return "0"
+            # ADMIT: count alone -- reasons are uninteresting.
+            if verb == "ADMIT":
+                return str(total)
+            # DEFER / SKIP / PREEMPTED: include reason breakdown.
+            reasons = verb_to_reason_counts[verb]
+            parts = ",".join(f"{r}={c}" for r, c in sorted(reasons.items()))
+            return f"{total}({parts})"
+
         logger.info(
             "[sched step=%d budget=%d/%d running=%d waiting=%d%s] "
             "admit=%s defer=%s skip=%s preempt=%s",
@@ -2099,10 +2150,10 @@ class Scheduler(SchedulerInterface):
             len(self.running),
             len(self.waiting) + len(self.skipped_waiting),
             model_breakdown,
-            buckets.get("ADMIT") or "[]",
-            buckets.get("DEFER") or "[]",
-            buckets.get("SKIP") or "[]",
-            buckets.get("PREEMPTED") or "[]",
+            _verb_summary("ADMIT"),
+            _verb_summary("DEFER"),
+            _verb_summary("SKIP"),
+            _verb_summary("PREEMPTED"),
         )
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:

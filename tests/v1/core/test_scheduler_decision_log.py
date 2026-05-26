@@ -23,14 +23,23 @@ import vllm.v1.core.sched.scheduler as sched_module
 from vllm.v1.core.sched.scheduler import Scheduler
 
 
-def _stub_scheduler(enabled: bool) -> Scheduler:
+def _stub_scheduler(enabled: bool, level: int | None = None) -> Scheduler:
+    """Build a Scheduler stub for decision-log tests.
+
+    `enabled` is the legacy boolean. `level` overrides it explicitly:
+      0 = disabled, 1 = compact, 2 = verbose.
+    When `level` is None we infer from `enabled` (1 if True, 0 if False).
+    """
     sched = Scheduler.__new__(Scheduler)
     sched.dual_model_config = None
     sched._num_running_decode_reqs = 0
     sched._num_running_embed_reqs = 0
     sched._num_waiting_decode_reqs = 0
     sched._num_waiting_embed_reqs = 0
-    sched._decision_log_enabled = enabled
+    if level is None:
+        level = 1 if enabled else 0
+    sched._decision_log_level = level
+    sched._decision_log_enabled = level > 0
     sched._decision_step = 0
     sched._decisions = []
     sched.running = []
@@ -82,9 +91,41 @@ def test_flush_noop_when_disabled(monkeypatch):
     assert calls == []
 
 
-def test_flush_emits_grouped_log_when_enabled(monkeypatch):
+def test_flush_compact_emits_counts_with_reason_breakdown(monkeypatch):
+    """Level 1 (compact): counts per verb + reason breakdown for
+    defers/skips/preempts. Per-request ids are NOT emitted -- keeps log
+    size bounded across thousands of steps."""
     calls = _capture_logger_info(monkeypatch)
-    sched = _stub_scheduler(enabled=True)
+    sched = _stub_scheduler(enabled=False, level=1)
+    sched._decision_step = 5
+    sched._decisions = [
+        ("req-1", "ADMIT_RUNNING", 7),
+        ("req-2", "ADMIT_WAITING", 256),
+        ("req-3", "DEFER_KV_FULL", 0),
+        ("req-4", "DEFER_EMBED_GATE", 0),
+        ("req-5", "SKIP_NO_NEW_TOKENS", 0),
+        ("req-6", "PREEMPTED_KV_FULL", 0),
+    ]
+    sched._flush_decision_log(budget_remaining=200, budget_total=1000)
+    assert len(calls) == 1
+    line = calls[0]
+    assert "step=5" in line
+    assert "budget=800/1000" in line
+    # ADMIT collapses to a count.
+    assert "admit=2 " in line
+    # DEFER includes the reason breakdown -- one DEFER_KV_FULL + one DEFER_EMBED_GATE.
+    assert "defer=2(DEFER_EMBED_GATE=1,DEFER_KV_FULL=1)" in line
+    assert "skip=1(SKIP_NO_NEW_TOKENS=1)" in line
+    assert "preempt=1(PREEMPTED_KV_FULL=1)" in line
+    # Per-request ids must NOT appear in compact mode.
+    for req_id in ("req-1", "req-2", "req-3", "req-4", "req-5", "req-6"):
+        assert req_id not in line, f"{req_id} leaked into compact log"
+
+
+def test_flush_verbose_emits_full_request_lists(monkeypatch):
+    """Level 2 (verbose): the original per-request-list format."""
+    calls = _capture_logger_info(monkeypatch)
+    sched = _stub_scheduler(enabled=False, level=2)
     sched._decision_step = 5
     sched._decisions = [
         ("req-1", "ADMIT_RUNNING", 7),
@@ -98,12 +139,24 @@ def test_flush_emits_grouped_log_when_enabled(monkeypatch):
     line = calls[0]
     assert "step=5" in line
     assert "budget=800/1000" in line
-    # ADMIT bucket gets both ADMIT_RUNNING and ADMIT_WAITING entries
+    # Verbose keeps the full label including request id and reason.
     assert "req-1:ADMIT_RUNNING:7" in line
     assert "req-2:ADMIT_WAITING:256" in line
     assert "req-3:DEFER_KV_FULL" in line
     assert "req-4:SKIP_NO_NEW_TOKENS" in line
     assert "req-5:PREEMPTED_KV_FULL" in line
+
+
+def test_flush_compact_empty_buckets_show_zero(monkeypatch):
+    """When a verb has no entries, compact mode emits `verb=0` (not
+    `verb=0()`). Confirms the empty-bucket fast-path."""
+    calls = _capture_logger_info(monkeypatch)
+    sched = _stub_scheduler(enabled=False, level=1)
+    sched._decisions = [("r", "ADMIT_RUNNING", 1)]
+    sched._flush_decision_log(budget_remaining=0, budget_total=10)
+    assert "defer=0 " in calls[0]
+    assert "skip=0 " in calls[0]
+    assert "preempt=0" in calls[0]
 
 
 def test_flush_suppresses_per_model_block_when_single_model(monkeypatch):
