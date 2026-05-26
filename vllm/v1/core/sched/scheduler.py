@@ -837,6 +837,20 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
+                # Defensive KV pressure gate. Defer NEW admissions when
+                # KV usage is at/above the configured threshold; running
+                # reqs carry over freely. Protects against pair-dep
+                # release cascades where many decode children land in
+                # waiting simultaneously and would overcommit the KV
+                # cache in a single step.
+                if Scheduler._kv_pressure_should_defer(
+                    _dual_cfg, self.kv_cache_manager.usage
+                ):
+                    self._log_decision(request_id, "DEFER_KV_PRESSURE")
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -2316,6 +2330,24 @@ class Scheduler(SchedulerInterface):
     # _is_blocked_without_state_change peeks without mutation, used by
     # _select_waiting_queue_for_scheduling.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kv_pressure_should_defer(
+        dual_cfg: DualModelConfig | None, kv_usage: float
+    ) -> bool:
+        """KV pressure defensive gate.
+
+        When dual_model_config.kv_pressure_skip_threshold is set, defer
+        all NEW waiting-queue admissions while the KV cache is at or
+        above the threshold. Running requests carry over freely -- this
+        only blocks fresh admissions from claiming new blocks during a
+        pair-dep release cascade.
+
+        Returns False (admit normally) when the gate is disabled.
+        """
+        if dual_cfg is None or dual_cfg.kv_pressure_skip_threshold is None:
+            return False
+        return kv_usage >= dual_cfg.kv_pressure_skip_threshold
 
     @staticmethod
     def _bucket_for_request(
