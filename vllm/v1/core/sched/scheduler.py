@@ -506,6 +506,46 @@ class Scheduler(SchedulerInterface):
         else:
             _decision_initial_budget = token_budget
 
+        # Per-bucket token budgets for dual-model per-step caps. None means
+        # no cap (treated as +inf below). See DualModelConfig field docs
+        # (EPT family). Bucketing is by (model_id, num_output_tokens):
+        #   decode_prefill: gen request, no output yet
+        #   decode_loop:    gen request, has output tokens
+        #   embed_prefill:  embed request (always one-shot prefill)
+        _dual_cfg = self.dual_model_config
+
+        def _bkt_budget(name: str) -> float:
+            if _dual_cfg is None:
+                return float("inf")
+            v = getattr(_dual_cfg, f"max_{name}_tokens_per_step", None)
+            return float(v) if v is not None else float("inf")
+
+        bkt_decode_prefill_budget = _bkt_budget("decode_prefill")
+        bkt_decode_loop_budget = _bkt_budget("decode_loop")
+        bkt_embed_prefill_budget = _bkt_budget("embed_prefill")
+
+        # Step-local flags for the no-double-prefill (NDP) admission gate.
+        # Set ONLY when a *fresh* prefill admission lands in the waiting-
+        # loop path this step. Chunked-prefill carry-over (running-loop)
+        # does NOT set these -- under chunked prefill, every step has
+        # prefill chunks in running, so triggering on carry-over would
+        # defer all opposite-kind prefill admissions indefinitely. The
+        # semantically correct rule is "do not admit two *fresh*
+        # GEMM-bound prefills as new starts in the same step". Carry-
+        # over chunks compose freely.
+        step_admitted_FRESH_decode_prefill = False
+        step_admitted_FRESH_embed_prefill = False
+
+        def _bucket_for(req: "Request") -> str:
+            return Scheduler._bucket_for_request(_dual_cfg, req)
+
+        def _bucket_remaining(bucket: str) -> float:
+            if bucket == "decode_loop":
+                return bkt_decode_loop_budget
+            if bucket == "embed_prefill":
+                return bkt_embed_prefill_budget
+            return bkt_decode_prefill_budget
+
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -566,6 +606,22 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+
+            # Per-bucket EPT clamp for running reqs. Running-loop entries
+            # are carry-over (decode loop or chunked-prefill continuation).
+            # Skip the request if its bucket is exhausted; otherwise clamp.
+            _running_bucket = _bucket_for(request)
+            _running_bkt_remaining = _bucket_remaining(_running_bucket)
+            if num_new_tokens > _running_bkt_remaining:
+                if _running_bkt_remaining <= 0:
+                    self._log_decision(
+                        request.request_id,
+                        f"DEFER_BUCKET_{_running_bucket.upper()}",
+                        num_new_tokens,
+                    )
+                    req_index += 1
+                    continue
+                num_new_tokens = int(_running_bkt_remaining)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -676,6 +732,17 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            # Decrement per-bucket budget (EPT). Note: do NOT set
+            # step_admitted_FRESH_*_prefill here -- running-loop entries
+            # are carry-over (chunked-prefill continuations or in-flight
+            # prefills), not fresh admissions. NDP fires only on fresh
+            # admissions, which happen in the waiting loop.
+            if _running_bucket == "decode_loop":
+                bkt_decode_loop_budget -= num_new_tokens
+            elif _running_bucket == "embed_prefill":
+                bkt_embed_prefill_budget -= num_new_tokens
+            else:
+                bkt_decode_prefill_budget -= num_new_tokens
             req_index += 1
             self._log_decision(request_id, "ADMIT_RUNNING", num_new_tokens)
 
@@ -748,6 +815,27 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                # No-double-prefill (NDP) admission gate. Block a fresh
+                # embed-prefill admission this step if a fresh decode-
+                # prefill has already been admitted (waiting-loop), and
+                # symmetrically. Carry-over (already in `running`,
+                # including chunked-prefill continuations) does NOT
+                # trigger the gate -- see the comment near the
+                # step_admitted_FRESH_* flag declarations.
+                if _dual_cfg is not None and _dual_cfg.enforce_no_double_prefill:
+                    if Scheduler._ndp_should_defer(
+                        enforce_no_double_prefill=True,
+                        request_bucket=_bucket_for(request),
+                        fresh_decode_prefill_admitted=step_admitted_FRESH_decode_prefill,
+                        fresh_embed_prefill_admitted=step_admitted_FRESH_embed_prefill,
+                    ):
+                        self._log_decision(
+                            request_id, "DEFER_NO_DOUBLE_PREFILL"
+                        )
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -945,6 +1033,29 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
+                    # Per-bucket EPT clamp for fresh waiting admissions.
+                    # If this request's bucket is exhausted, defer to
+                    # skipped queue (don't break -- other-bucket reqs
+                    # may still fit). With chunked-prefill disabled OR
+                    # bucket empty, we have to defer entirely; otherwise
+                    # we can partial-admit up to the remaining budget.
+                    _waiting_bucket = _bucket_for(request)
+                    _waiting_bkt_remaining = _bucket_remaining(_waiting_bucket)
+                    if num_new_tokens > _waiting_bkt_remaining:
+                        if (
+                            not self.scheduler_config.enable_chunked_prefill
+                            or _waiting_bkt_remaining <= 0
+                        ):
+                            self._log_decision(
+                                request_id,
+                                f"DEFER_BUCKET_{_waiting_bucket.upper()}",
+                                num_new_tokens,
+                            )
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        num_new_tokens = int(_waiting_bkt_remaining)
+
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
                         (
@@ -1100,6 +1211,18 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # Decrement per-bucket budget (EPT). Set
+                # step_admitted_FRESH_* -- this is a fresh admission
+                # from the waiting queue, the only path that should
+                # trip the NDP gate.
+                if _waiting_bucket == "decode_loop":
+                    bkt_decode_loop_budget -= num_new_tokens
+                elif _waiting_bucket == "embed_prefill":
+                    bkt_embed_prefill_budget -= num_new_tokens
+                    step_admitted_FRESH_embed_prefill = True
+                else:
+                    bkt_decode_prefill_budget -= num_new_tokens
+                    step_admitted_FRESH_decode_prefill = True
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -2193,6 +2316,52 @@ class Scheduler(SchedulerInterface):
     # _is_blocked_without_state_change peeks without mutation, used by
     # _select_waiting_queue_for_scheduling.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bucket_for_request(
+        dual_cfg: DualModelConfig | None, request: Request
+    ) -> str:
+        """Classify a request into one of {decode_prefill, decode_loop,
+        embed_prefill} for per-bucket EPT budget accounting.
+
+        - embed_prefill: request.model_id matches the embed model id.
+          (Pooling models always run as a one-shot prefill, so there
+          is no "embed_loop".)
+        - decode_loop:   gen request with at least one output token.
+        - decode_prefill: gen request with no output yet.
+
+        When dual_cfg is None, every request is "decode_loop" or
+        "decode_prefill" -- no embed bucket exists.
+        """
+        if (
+            dual_cfg is not None
+            and request.model_id == dual_cfg.embed_model_id
+        ):
+            return "embed_prefill"
+        return "decode_loop" if request.num_output_tokens > 0 else "decode_prefill"
+
+    @staticmethod
+    def _ndp_should_defer(
+        enforce_no_double_prefill: bool,
+        request_bucket: str,
+        fresh_decode_prefill_admitted: bool,
+        fresh_embed_prefill_admitted: bool,
+    ) -> bool:
+        """No-double-prefill predicate.
+
+        Returns True iff NDP is enabled AND admitting this request
+        would put two fresh GEMM-bound prefills (one decode + one
+        embed) in the same step. Carry-over chunks compose freely;
+        the FRESH_* booleans are set only on fresh waiting-loop
+        admissions.
+        """
+        if not enforce_no_double_prefill:
+            return False
+        if request_bucket == "embed_prefill" and fresh_decode_prefill_admitted:
+            return True
+        if request_bucket == "decode_prefill" and fresh_embed_prefill_admitted:
+            return True
+        return False
 
     @staticmethod
     def _embed_waiting_gate_enabled(dual_cfg: DualModelConfig) -> bool:
