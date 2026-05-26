@@ -217,6 +217,7 @@ class LLMEngine:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         prompt_text: str | None = None,
+        parent_request_id: str | None = None,
     ) -> str:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -250,6 +251,14 @@ class LLMEngine:
                 priority=priority,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+
+        # Pair-dep gating: stash parent_request_id onto the
+        # EngineCoreRequest so the scheduler's
+        # _should_gate_child_on_parent can hold this request in
+        # _gated_children until the parent finishes. No-op when
+        # parent_request_id is None.
+        if parent_request_id is not None:
+            request.parent_request_id = parent_request_id
 
         self.input_processor.assign_request_id(request)
 
