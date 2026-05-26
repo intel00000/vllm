@@ -201,6 +201,17 @@ class Scheduler(SchedulerInterface):
         self._num_waiting_decode_reqs = 0
         self._num_waiting_embed_reqs = 0
 
+        # Two-phase "release embed after decode waiting drains" gate
+        # state (see DualModelConfig.embed_release_when_decode_waiting_drained).
+        # phase_started flips True the first time we see decode waiting
+        # > 0 with the gate enabled; phase_released flips True the first
+        # time we observe decode waiting drained while phase_started.
+        # Together they implement a one-shot phase transition so we
+        # don't oscillate between "decode-only" and "mixed" modes on
+        # short waiting-queue dips.
+        self._embed_wait_drained_phase_started = False
+        self._embed_wait_drained_phase_released = False
+
         # RAG pair-dependency state. A child request (typically a decode
         # whose generation depends on the result of an embed) can carry
         # parent_request_id pointing at its parent. While the parent is
@@ -727,6 +738,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # Embed-side admission gate. Pop deferred embeds into
+                # step_skipped_waiting so the scan continues with the
+                # next request (typically a decode that can be admitted)
+                # instead of head-of-line blocking on a gated embed.
+                if self._should_skip_embed_waiting_request(request):
+                    self._log_decision(request_id, "DEFER_EMBED_GATE")
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -2158,6 +2179,120 @@ class Scheduler(SchedulerInterface):
                 self._log_decision(child_id, "ADMIT_RELEASED_BY_PARENT")
 
     # ------------------------------------------------------------------
+    # Embed-waiting admission gate: DRR / MER / release knobs.
+    # Skips admitting an embed request from the waiting queue when:
+    #   - MER hits its cap (running_embed >= max_embed_running_reqs)
+    #   - the phase-aware "release after decode drained" knob is still
+    #     in the holding phase
+    #   - embed_release_running_decode_threshold has been exceeded
+    #     (decode load too high to admit more embed)
+    #   - DRR floor not yet met (running_decode < reserve while there
+    #     are still decode waiters)
+    # Two flavors: _should_skip_* mutates the phase-tracking flags so it
+    # is safe to call once per request as part of the schedule pass.
+    # _is_blocked_without_state_change peeks without mutation, used by
+    # _select_waiting_queue_for_scheduling.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _embed_waiting_gate_enabled(dual_cfg: DualModelConfig) -> bool:
+        return (
+            dual_cfg.max_embed_running_reqs is not None
+            or dual_cfg.embed_release_when_decode_waiting_drained
+            or dual_cfg.embed_release_running_decode_threshold is not None
+            or dual_cfg.decode_running_reserve is not None
+        )
+
+    def _should_skip_embed_waiting_request(self, request: Request) -> bool:
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
+            return False
+
+        if not self._embed_waiting_gate_enabled(dual_cfg):
+            return False
+
+        running_decode = self._num_running_decode_reqs
+        running_embed = self._num_running_embed_reqs
+        waiting_decode_total = self._num_waiting_decode_reqs
+        if (
+            dual_cfg.max_embed_running_reqs is not None
+            and running_embed >= dual_cfg.max_embed_running_reqs
+        ):
+            return True
+
+        if dual_cfg.embed_release_when_decode_waiting_drained:
+            if waiting_decode_total > 0:
+                self._embed_wait_drained_phase_started = True
+                return True
+            if not self._embed_wait_drained_phase_started:
+                return running_decode > 0
+            if not self._embed_wait_drained_phase_released:
+                self._embed_wait_drained_phase_released = True
+
+        if (
+            dual_cfg.embed_release_running_decode_threshold is not None
+            and running_decode > dual_cfg.embed_release_running_decode_threshold
+        ):
+            return True
+
+        if (
+            dual_cfg.decode_running_reserve is not None
+            and running_decode < dual_cfg.decode_running_reserve
+            and (waiting_decode_total > 0)
+        ):
+            return True
+
+        return False
+
+    def _is_embed_gate_blocked_without_state_change(
+        self, request: Request
+    ) -> bool:
+        """Mirror of _should_skip_embed_waiting_request without flag mutation.
+
+        Used by _select_waiting_queue_for_scheduling to decide whether
+        to drain the skipped_waiting queue head this step.
+        """
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
+            return False
+
+        if not self._embed_waiting_gate_enabled(dual_cfg):
+            return False
+
+        running_decode = self._num_running_decode_reqs
+        running_embed = self._num_running_embed_reqs
+        waiting_decode_total = self._num_waiting_decode_reqs
+
+        if (
+            dual_cfg.max_embed_running_reqs is not None
+            and running_embed >= dual_cfg.max_embed_running_reqs
+        ):
+            return True
+
+        if dual_cfg.embed_release_when_decode_waiting_drained:
+            if waiting_decode_total > 0:
+                return True
+            if not self._embed_wait_drained_phase_started and running_decode > 0:
+                return True
+            if not self._embed_wait_drained_phase_released:
+                return False
+
+        if (
+            dual_cfg.embed_release_running_decode_threshold is not None
+            and running_decode > dual_cfg.embed_release_running_decode_threshold
+        ):
+            return True
+
+        if (
+            dual_cfg.decode_running_reserve is not None
+            and running_decode < dual_cfg.decode_running_reserve
+            and waiting_decode_total > 0
+        ):
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
     # Decision log (HB_SCHEDULER_DECISION_LOG=1).
     #
     # Per-step structured log of admit/defer/skip/preempt reasons, so we
@@ -2217,6 +2352,14 @@ class Scheduler(SchedulerInterface):
         )
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        # If the head of skipped_waiting is an embed that the gate
+        # would defer again, fall through to self.waiting so decode
+        # admissions don't get blocked.
+        if self.skipped_waiting:
+            skipped_req = self.skipped_waiting.peek_request()
+            if self._is_embed_gate_blocked_without_state_change(skipped_req):
+                return self.waiting or None
+
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
