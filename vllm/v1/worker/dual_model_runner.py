@@ -343,13 +343,27 @@ class DualModelRunner:
                 continue
             if name in updates:
                 init_kwargs[name] = updates.pop(name)
-            elif hasattr(instance, name):
-                init_kwargs[name] = getattr(instance, name)
-            elif parameter.default is inspect._empty:
-                raise ValueError(
-                    f"Missing required constructor argument {name!r} for "
-                    f"{cls.__name__}."
-                )
+                continue
+            if not hasattr(instance, name):
+                if parameter.default is inspect._empty:
+                    raise ValueError(
+                        f"Missing required constructor argument {name!r} for "
+                        f"{cls.__name__}."
+                    )
+                continue
+            value = getattr(instance, name)
+            # Pydantic dataclass quirk (v0.21.0+ vllm.config.ModelConfig):
+            # InitVar fields like mm_tensor_ipc don't persist as
+            # meaningful attributes on the instance -- they surface as
+            # None. Copying None back through cls(**kwargs) then fails
+            # the InitVar's Literal validation. Drop None copies from
+            # the source; the new instance's own default path
+            # (MultiModalConfig.mm_tensor_ipc = "direct_rpc") handles
+            # them. The caller's `updates` dict overrides this -- it's
+            # already applied above and never reaches this branch.
+            if value is None:
+                continue
+            init_kwargs[name] = value
         init_kwargs.update(updates)
         return cls(**init_kwargs)
 
