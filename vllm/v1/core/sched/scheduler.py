@@ -2107,12 +2107,16 @@ class Scheduler(SchedulerInterface):
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         # If the head of skipped_waiting is an embed that the gate
-        # would defer again, fall through to self.waiting so decode
-        # admissions don't get blocked.
+        # would defer again, prefer self.waiting so decode admissions
+        # don't get blocked. When self.waiting is empty too, fall back
+        # to skipped_waiting -- the main loop's state-changing gate
+        # check will pop+defer the head correctly (rather than
+        # returning None here, which would trip the outer
+        # `assert request_queue is not None`).
         if self.skipped_waiting:
             skipped_req = self.skipped_waiting.peek_request()
             if self._is_embed_gate_blocked_without_state_change(skipped_req):
-                return self.waiting or None
+                return self.waiting or self.skipped_waiting
 
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None

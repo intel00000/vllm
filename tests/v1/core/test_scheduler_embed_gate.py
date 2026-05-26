@@ -180,3 +180,69 @@ def test_peek_variant_agrees_with_skip_variant_on_steady_state():
         sched._is_embed_gate_blocked_without_state_change(_req("embed")) is True
     )
     assert sched._should_skip_embed_waiting_request(_req("embed")) is True
+
+
+# --------------------------------------------------------------------------
+# _select_waiting_queue_for_scheduling -- regression for gate-blocked head
+# --------------------------------------------------------------------------
+
+
+class _StubQueue:
+    """Minimal RequestQueue duck-type for the selector test."""
+
+    def __init__(self, items: list) -> None:
+        self._items = list(items)
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def peek_request(self):
+        return self._items[0]
+
+
+def test_selector_falls_back_to_skipped_when_waiting_empty_and_skipped_blocked():
+    """Regression: when skipped_waiting head is gate-blocked AND
+    self.waiting is empty, the selector must return skipped_waiting
+    (not None). Returning None tripped 'assert request_queue is not None'
+    in the schedule() loop on slurm. Discovered in port validation
+    LM_drr16_full_long_fa, fixed before the wave-gate work."""
+    from vllm.v1.core.sched.scheduler import SchedulingPolicy
+
+    cfg = DualModelConfig(embed_model="x", max_embed_running_reqs=4)
+    sched = _stub_scheduler(cfg)
+    sched._num_running_embed_reqs = 4  # cap reached, embeds are blocked
+    sched.policy = SchedulingPolicy.FCFS
+
+    blocked_embed = _req("embed")
+    sched.skipped_waiting = _StubQueue([blocked_embed])
+    sched.waiting = _StubQueue([])
+
+    result = sched._select_waiting_queue_for_scheduling()
+    assert result is not None, (
+        "Selector must not return None when skipped_waiting has items; "
+        "letting the gate-blocked head fall through to the main loop's "
+        "state-changing gate is the correct behavior."
+    )
+    assert result is sched.skipped_waiting
+
+
+def test_selector_prefers_waiting_when_both_have_items_and_skipped_blocked():
+    """When both queues are non-empty and skipped's head is gate-blocked,
+    prefer self.waiting -- this is the head-of-line-blocking avoidance
+    that motivated _is_embed_gate_blocked_without_state_change in the
+    first place."""
+    from vllm.v1.core.sched.scheduler import SchedulingPolicy
+
+    cfg = DualModelConfig(embed_model="x", max_embed_running_reqs=4)
+    sched = _stub_scheduler(cfg)
+    sched._num_running_embed_reqs = 4  # blocks embeds
+    sched.policy = SchedulingPolicy.FCFS
+
+    sched.skipped_waiting = _StubQueue([_req("embed")])  # blocked
+    sched.waiting = _StubQueue([_req("decode")])  # admittable
+
+    result = sched._select_waiting_queue_for_scheduling()
+    assert result is sched.waiting
