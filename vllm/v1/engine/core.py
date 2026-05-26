@@ -85,6 +85,33 @@ logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
+
+@contextmanager
+def engine_core_nvtx_range(name: str):
+    """Optional NVTX wrapper for engine-core step phases.
+
+    Off by default; opt in via HB_ENGINE_CORE_NVTX_RANGES=1 to add
+    timeline tags around schedule / execute_model / sample_tokens /
+    update_from_output. Useful when reading nsys traces to attribute
+    GPU gaps to engine-side host work.
+    """
+    if os.environ.get("HB_ENGINE_CORE_NVTX_RANGES", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        yield
+        return
+    import torch
+
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
@@ -414,23 +441,32 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        with engine_core_nvtx_range("engine_core: schedule"):
+            scheduler_output = self.scheduler.schedule()
+        with engine_core_nvtx_range("engine_core: execute_model_submit"):
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+        with engine_core_nvtx_range("engine_core: grammar_bitmask"):
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
-            model_output = future.result()
+            with engine_core_nvtx_range("engine_core: execute_model_result"):
+                model_output = future.result()
             if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+                with engine_core_nvtx_range("engine_core: sample_tokens"):
+                    model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        with engine_core_nvtx_range("engine_core: process_aborts"):
+            self._process_aborts_queue()
+        with engine_core_nvtx_range("engine_core: update_from_output"):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
