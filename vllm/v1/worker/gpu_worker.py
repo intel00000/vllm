@@ -204,6 +204,25 @@ class Worker(WorkerBase):
         if self.profiler_config.profiler not in ("torch", "cuda", None):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
+        # Optional role label prefixed onto NVTX annotations so two
+        # workers running in the same process (e.g. gen+embed overlap)
+        # produce visually distinguishable timeline tags.
+        self._work_role = os.environ.get("HB_WORK_ROLE", "")
+
+        # Whether to emit per-step NVTX annotations from
+        # annotate_profile() even when start_profile() has not been
+        # called. Needed when a secondary worker doesn't own
+        # cudaProfilerStart/Stop but still wants timeline tags. Off by
+        # default to match upstream behavior.
+        self._emit_step_nvtx = os.environ.get(
+            "HB_GPU_WORKER_NVTX_RANGES", "0"
+        ).lower() in ("1", "true", "yes", "on")
+
+        # Monotonic scheduler step counter for NVTX annotation. Reset
+        # to 0 by profile(is_start=True) so step_1 aligns with the
+        # first captured step.
+        self._sched_step: int = 0
+
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
@@ -990,15 +1009,47 @@ class Worker(WorkerBase):
         return self.model_runner.get_encoder_timing_stats()
 
     def annotate_profile(self, scheduler_output):
-        # add trace annotation so that we can easily distinguish
-        # context/generation request numbers in each iteration.
-        # A context request is a request that has not yet generated any tokens
-        if not self.profiler:
+        # Add a trace annotation so we can distinguish
+        # context/generation request numbers in each iteration. A context
+        # request is one that has not yet generated any tokens.
+
+        # Step the profiler for iteration tracking (delay / max-iter logic).
+        if self.profiler:
+            self.profiler.step()
+
+        # Emit NVTX when the profiler is running (normal path) OR when
+        # the secondary-worker fallback is explicitly enabled via
+        # HB_GPU_WORKER_NVTX_RANGES (overlap scenario where this worker
+        # doesn't own cudaProfilerStart/Stop but still needs timeline
+        # tags).
+        profiler_type = self.profiler_config.profiler if self.profiler_config else None
+        emit_fallback = self._emit_step_nvtx and profiler_type is not None
+        if not self.profiler and not emit_fallback:
             return nullcontext()
 
-        self.profiler.step()
+        # Pass dual-model context info if the runner has it.
+        # DualModelRunner exposes `req_id_to_model_id` and
+        # `dual_cfg.embed_model_id`. Single-model runners don't have
+        # these; for those we use the runner's is_pooling_model flag to
+        # bucket context as ectx_* (pooling/embed baseline) or dctx_*
+        # (generative baseline).
+        rid_to_mid = getattr(self.model_runner, "req_id_to_model_id", None)
+        dual_cfg = getattr(self.model_runner, "dual_cfg", None)
+        embed_model_id = (
+            getattr(dual_cfg, "embed_model_id", None) if dual_cfg else None
+        )
+        single_runner_kind: str | None = None
+        if rid_to_mid is None and dual_cfg is None:
+            if getattr(self.model_runner, "is_pooling_model", False):
+                single_runner_kind = "pooling"
+        iteration_details = compute_iteration_details(
+            scheduler_output,
+            req_id_to_model_id=rid_to_mid,
+            embed_model_id=embed_model_id,
+            single_runner_kind=single_runner_kind,
+        )
 
-        iteration_details = compute_iteration_details(scheduler_output)
+        self._sched_step += 1
 
         if self.vllm_config.profiler_config.detailed_trace_annotation:
             # Compute roofline-model metrics per request, split by phase
@@ -1084,21 +1135,38 @@ class Worker(WorkerBase):
                 ]
             )
         else:
-            annotation = "".join(
+            _LONG_SEQ_THRESHOLD = 32768
+            _max_seq = iteration_details.max_seq_tokens
+            parts: list[str] = []
+            if self._work_role:
+                parts.extend([self._work_role, "_"])
+            parts.extend(
                 [
-                    "execute_context_",
-                    str(iteration_details.num_ctx_requests),
+                    "step_",
+                    str(self._sched_step),
+                    "_dctx_",
+                    str(iteration_details.num_decode_ctx_requests),
                     "(",
-                    str(iteration_details.num_ctx_tokens),
-                    ")",
-                    "_generation_",
+                    str(iteration_details.num_decode_ctx_tokens),
+                    ")_ectx_",
+                    str(iteration_details.num_embed_ctx_requests),
+                    "(",
+                    str(iteration_details.num_embed_ctx_tokens),
+                    ")_dgen_",
                     str(iteration_details.num_generation_requests),
                     "(",
                     str(iteration_details.num_generation_tokens),
-                    ")",
+                    ")_maxseq_",
+                    str(_max_seq),
                 ]
             )
-        return self.profiler.annotate_context_manager(annotation)
+            if _max_seq > _LONG_SEQ_THRESHOLD:
+                parts.append("_LONG")
+            annotation = "".join(parts)
+
+        if self.profiler:
+            return self.profiler.annotate_context_manager(annotation)
+        return torch.cuda.nvtx.range(annotation)
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1213,6 +1281,9 @@ class Worker(WorkerBase):
             )
 
         if is_start:
+            # Reset the NVTX step counter so step_1 aligns with the
+            # first captured step within this profiling window.
+            self._sched_step = 0
             # Generate the trace name by combining prefix with comprehensive rank suffix
             from vllm.distributed.utils import get_worker_rank_suffix
 
