@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -179,6 +180,16 @@ class Scheduler(SchedulerInterface):
         self._num_waiting_decode_reqs = 0
         self._num_waiting_embed_reqs = 0
 
+        # Per-step decision log. Enabled by HB_SCHEDULER_DECISION_LOG=1.
+        # Records each request's admit/defer/skip/preempt reason so we can
+        # explain batching choices alongside per-model counts in
+        # SchedulerStats. No-op when disabled.
+        self._decision_log_enabled = os.environ.get(
+            "HB_SCHEDULER_DECISION_LOG", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._decision_step: int = 0
+        self._decisions: list[tuple[str, str, int]] = []
+
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
         # requests so that they can free the cached states for those requests.
@@ -346,6 +357,16 @@ class Scheduler(SchedulerInterface):
             # Do not schedule any requests when paused.
             token_budget = 0
 
+        # Decision-log step counter + initial budget snapshot. No-op when
+        # HB_SCHEDULER_DECISION_LOG is unset (see _log_decision /
+        # _flush_decision_log).
+        if self._decision_log_enabled:
+            self._decision_step += 1
+            self._decisions = []
+            _decision_initial_budget = token_budget
+        else:
+            _decision_initial_budget = token_budget
+
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -493,6 +514,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            self._log_decision(request_id, "ADMIT_RUNNING", num_new_tokens)
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -780,6 +802,7 @@ class Scheduler(SchedulerInterface):
                 self._mark_waiting_removed_by_model(request)
                 self.running.append(request)
                 self._mark_running_added_by_model(request)
+                self._log_decision(request_id, "ADMIT_WAITING", num_new_tokens)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -917,6 +940,13 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        if self._decision_log_enabled:
+            self._flush_decision_log(
+                budget_remaining=token_budget,
+                budget_total=_decision_initial_budget,
+            )
+
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -947,6 +977,7 @@ class Scheduler(SchedulerInterface):
         self._mark_running_removed_by_model(request)
         self.waiting.prepend_request(request)
         self._mark_waiting_added_by_model(request)
+        self._log_decision(request.request_id, "PREEMPTED_KV_FULL")
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1614,6 +1645,65 @@ class Scheduler(SchedulerInterface):
         elif kind == "embed":
             assert self._num_running_embed_reqs > 0
             self._num_running_embed_reqs -= 1
+
+    # ------------------------------------------------------------------
+    # Decision log (HB_SCHEDULER_DECISION_LOG=1).
+    #
+    # Per-step structured log of admit/defer/skip/preempt reasons, so we
+    # can explain WHY a request was held back when the per-model
+    # counts (above) only answer WHAT got scheduled. Emitted at INFO
+    # level via the module logger when enabled, and a no-op when the
+    # env var is unset. Reasons follow the convention
+    # "ADMIT_*", "DEFER_*", "SKIP_*", "PREEMPTED_*"; the leading verb
+    # is what flush groups by.
+    # ------------------------------------------------------------------
+
+    def _log_decision(
+        self, req_id: str, reason: str, num_tokens: int = 0
+    ) -> None:
+        if self._decision_log_enabled:
+            self._decisions.append((req_id, reason, num_tokens))
+
+    def _flush_decision_log(
+        self, *, budget_remaining: int, budget_total: int
+    ) -> None:
+        if not self._decision_log_enabled:
+            return
+        buckets: dict[str, list[str]] = defaultdict(list)
+        for req_id, reason, n in self._decisions:
+            label = f"{req_id}:{reason}"
+            if n > 0:
+                label = f"{label}:{n}"
+            head = reason.split("_", 1)[0]
+            buckets[head].append(label)
+
+        # Per-model breakdown is only meaningful when dual_model_config
+        # is set. Suppress on vanilla single-model runs to avoid
+        # misleading `decode=0/0 embed=0/0` noise.
+        if self.dual_model_config is not None:
+            model_breakdown = (
+                f" decode={self._num_running_decode_reqs}/"
+                f"{self._num_waiting_decode_reqs} "
+                f"embed={self._num_running_embed_reqs}/"
+                f"{self._num_waiting_embed_reqs}"
+            )
+        else:
+            model_breakdown = ""
+
+        logger.info(
+            "[sched step=%d budget=%d/%d running=%d waiting=%d%s] "
+            "admit=%s defer=%s skip=%s preempt=%s",
+            self._decision_step,
+            budget_total - budget_remaining,
+            budget_total,
+            len(self.running),
+            len(self.waiting) + len(self.skipped_waiting),
+            model_breakdown,
+            buckets.get("ADMIT") or "[]",
+            buckets.get("DEFER") or "[]",
+            buckets.get("SKIP") or "[]",
+            buckets.get("PREEMPTED") or "[]",
+        )
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
