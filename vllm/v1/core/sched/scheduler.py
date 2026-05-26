@@ -2415,6 +2415,86 @@ class Scheduler(SchedulerInterface):
             or dual_cfg.decode_running_reserve is not None
         )
 
+    @staticmethod
+    def _compute_in_prefill_sets(
+        running: Iterable["Request"],
+        dual_cfg: DualModelConfig | None,
+    ) -> tuple[set[str], set[str]]:
+        """Snapshot which running requests are still in prefill, split by
+        model side. A request is "in prefill" iff
+        num_computed_tokens < num_prompt_tokens (chunked prefill spans
+        multiple steps; this predicate stays True until the last chunk
+        lands).
+
+        Returns (gen_in_prefill, embed_in_prefill). When dual_cfg is
+        None both sets are empty -- the wave-gate is dual-model only.
+        """
+        gen_pf: set[str] = set()
+        embed_pf: set[str] = set()
+        if dual_cfg is None:
+            return gen_pf, embed_pf
+        embed_id = dual_cfg.embed_model_id
+        for req in running:
+            if req.num_computed_tokens >= req.num_prompt_tokens:
+                continue
+            if req.model_id == embed_id:
+                embed_pf.add(req.request_id)
+            else:
+                gen_pf.add(req.request_id)
+        return gen_pf, embed_pf
+
+    @staticmethod
+    def _wave_gate_blocks(
+        request: "Request",
+        dual_cfg: DualModelConfig | None,
+        gen_in_prefill: set[str],
+        embed_in_prefill: set[str],
+        request_bucket: str,
+    ) -> str | None:
+        """Wave-batching gate. Returns a DEFER_WAVE_* reason string when
+        the gate blocks this request, else None.
+
+        Phase exclusion:
+          - admitting a fresh embed-prefill is blocked while any gen
+            request is still in prefill (DEFER_WAVE_GEN_PREFILL_ACTIVE)
+          - admitting a fresh decode-prefill is blocked while any embed
+            is still in prefill (DEFER_WAVE_EMBED_PREFILL_ACTIVE)
+          - decode_loop is never blocked -- decode x embed-prefill
+            cross-row overlap is the productive partner this gate is
+            designed to protect.
+
+        Pair-dep'd children (those carrying a parent_request_id) are
+        skipped: pair-dep owns paired admission ordering; the
+        wave-gate is the global phase rule for free-floating requests.
+
+        wave_size, when set, additionally caps the per-side count of
+        concurrent prefills, returning DEFER_WAVE_SIZE_CAP.
+        """
+        if dual_cfg is None or not dual_cfg.wave_batching:
+            return None
+        if getattr(request, "parent_request_id", None) is not None:
+            return None
+        if request_bucket == "decode_loop":
+            return None
+        if request_bucket == "embed_prefill":
+            if gen_in_prefill:
+                return "DEFER_WAVE_GEN_PREFILL_ACTIVE"
+            if (
+                dual_cfg.wave_size is not None
+                and len(embed_in_prefill) >= dual_cfg.wave_size
+            ):
+                return "DEFER_WAVE_SIZE_CAP"
+            return None
+        # request_bucket == "decode_prefill"
+        if embed_in_prefill:
+            return "DEFER_WAVE_EMBED_PREFILL_ACTIVE"
+        if (
+            dual_cfg.wave_size is not None
+            and len(gen_in_prefill) >= dual_cfg.wave_size
+        ):
+            return "DEFER_WAVE_SIZE_CAP"
+        return None
+
     def _should_skip_embed_waiting_request(self, request: Request) -> bool:
         dual_cfg = self.dual_model_config
         if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
