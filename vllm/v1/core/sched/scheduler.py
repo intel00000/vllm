@@ -662,6 +662,18 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+            # Wave-batching gate snapshot. Identify which running
+            # requests are still in prefill on each side; the sets
+            # get mutated below as fresh prefills are admitted so
+            # the gate sees an accurate count within the same step
+            # (matters for the wave_size cap).
+            if _dual_cfg is not None and _dual_cfg.wave_batching:
+                _wave_gen_pf, _wave_embed_pf = (
+                    Scheduler._compute_in_prefill_sets(self.running, _dual_cfg)
+                )
+            else:
+                _wave_gen_pf, _wave_embed_pf = set(), set()
+
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -680,6 +692,29 @@ class Scheduler(SchedulerInterface):
                 # instead of head-of-line blocking on a gated embed.
                 if self._should_skip_embed_waiting_request(request):
                     self._log_decision(request_id, "DEFER_EMBED_GATE")
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                # Wave-batching gate. Phase exclusion: a fresh prefill
+                # on one side is held while the other side still has
+                # prefill in flight. Carry-over decode_loop x embed-
+                # prefill remains allowed (productive overlap). Sits
+                # between DRR/MER and NDP because the drain-phase
+                # state machine inside _should_skip_embed_waiting_request
+                # has already ticked, and wave-gate is the stricter
+                # formulation of NDP. Pair-dep'd children short-circuit
+                # in _wave_gate_blocks so pair-dep stays authoritative
+                # for paired admissions.
+                _wave_reason = Scheduler._wave_gate_blocks(
+                    request,
+                    _dual_cfg,
+                    _wave_gen_pf,
+                    _wave_embed_pf,
+                    _bucket_for(request),
+                )
+                if _wave_reason is not None:
+                    self._log_decision(request_id, _wave_reason)
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -999,9 +1034,13 @@ class Scheduler(SchedulerInterface):
                 elif _waiting_bucket == "embed_prefill":
                     bkt_embed_prefill_budget -= num_new_tokens
                     step_admitted_FRESH_embed_prefill = True
+                    # Keep the wave-gate snapshot accurate within
+                    # the step so the size cap counts fresh admits.
+                    _wave_embed_pf.add(request_id)
                 else:
                     bkt_decode_prefill_budget -= num_new_tokens
                     step_admitted_FRESH_decode_prefill = True
+                    _wave_gen_pf.add(request_id)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Encoder-related.
