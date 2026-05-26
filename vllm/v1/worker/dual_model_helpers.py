@@ -47,6 +47,11 @@ class DualModelConfig:
     #              {decode-prefill, embed-prefill} admitted per step)
     #   pair-dep = enforce_pair_dependency             (child decode req
     #              with parent_request_id waits until parent embed done)
+    #   WAVE     = wave_batching                       (phase-exclusion gate;
+    #              stricter superset of NDP -- forbids fresh prefill of one
+    #              side while the other side still has prefill running)
+    #   WSIZE    = wave_size                           (optional cap on the
+    #              number of concurrent prefills per side)
     # All gates are opt-in. None / False = single-model legacy behaviour.
     # ---------------------------------------------------------------------
 
@@ -101,6 +106,19 @@ class DualModelConfig:
     # at once and overcommit KV blocks in the same step. None = off (legacy).
     kv_pressure_skip_threshold: float | None = None
 
+    # WAVE / WSIZE: phase-exclusion gate. When wave_batching is True the
+    # scheduler refuses to admit a fresh embed-prefill while any gen
+    # request is still in prefill, and refuses to admit a fresh
+    # gen-prefill while any embed is still in prefill. Cross-row
+    # gen-decode x embed-prefill stays allowed (this is the productive
+    # memory-bandwidth-bound overlap). Free-floating requests only --
+    # pair-dep'd children short-circuit and let pair-dep own the
+    # ordering. wave_size optionally caps the number of concurrent
+    # prefills per side (None = unbounded within max_num_seqs). See
+    # notes/wave_batching_admission_gate_proposal.md.
+    wave_batching: bool = False
+    wave_size: int | None = None
+
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "DualModelConfig | None":
         additional_config = getattr(vllm_config, "additional_config", None)
@@ -153,6 +171,8 @@ class DualModelConfig:
                 raw_cfg.get("enforce_no_double_prefill", False)
             ),
             kv_pressure_skip_threshold=raw_cfg.get("kv_pressure_skip_threshold"),
+            wave_batching=bool(raw_cfg.get("wave_batching", False)),
+            wave_size=raw_cfg.get("wave_size"),
         )
 
 

@@ -40,6 +40,8 @@ def test_default_construct():
     assert cfg.enforce_no_double_prefill is False
     assert cfg.embed_release_when_decode_waiting_drained is False
     assert cfg.kv_pressure_skip_threshold is None
+    assert cfg.wave_batching is False
+    assert cfg.wave_size is None
 
 
 def test_from_vllm_config_parses_populated_dict():
@@ -55,6 +57,8 @@ def test_from_vllm_config_parses_populated_dict():
                 "embed_release_when_decode_waiting_drained": True,
                 "kv_pressure_skip_threshold": 0.9,
                 "embed_enable_chunked_prefill": False,
+                "wave_batching": True,
+                "wave_size": 128,
             }
         }
     )
@@ -69,12 +73,58 @@ def test_from_vllm_config_parses_populated_dict():
     assert cfg.embed_release_when_decode_waiting_drained is True
     assert cfg.kv_pressure_skip_threshold == 0.9
     assert cfg.embed_enable_chunked_prefill is False
+    assert cfg.wave_batching is True
+    assert cfg.wave_size == 128
 
 
 def test_embed_enable_chunked_prefill_defaults_to_none():
     """None means 'inherit gen scheduler_config.enable_chunked_prefill'."""
     cfg = DualModelConfig(embed_model="some/embed-model")
     assert cfg.embed_enable_chunked_prefill is None
+
+
+def test_wave_batching_omitted_keys_default_off():
+    """When the raw cfg lacks wave_batching/wave_size, the gate is off."""
+    vllm_config = SimpleNamespace(
+        additional_config={
+            DUAL_MODEL_CONFIG_KEY: {"embed_model": "some/embed-model"}
+        }
+    )
+    cfg = DualModelConfig.from_vllm_config(vllm_config)
+    assert cfg is not None
+    assert cfg.wave_batching is False
+    assert cfg.wave_size is None
+
+
+def test_wave_batching_enabled_without_size():
+    """wave_batching=True with no wave_size keeps wave_size None (unbounded)."""
+    vllm_config = SimpleNamespace(
+        additional_config={
+            DUAL_MODEL_CONFIG_KEY: {
+                "embed_model": "some/embed-model",
+                "wave_batching": True,
+            }
+        }
+    )
+    cfg = DualModelConfig.from_vllm_config(vllm_config)
+    assert cfg is not None
+    assert cfg.wave_batching is True
+    assert cfg.wave_size is None
+
+
+def test_wave_batching_coerces_truthy_to_bool():
+    """Non-bool truthy values (e.g. 1) are normalised to True."""
+    vllm_config = SimpleNamespace(
+        additional_config={
+            DUAL_MODEL_CONFIG_KEY: {
+                "embed_model": "some/embed-model",
+                "wave_batching": 1,
+            }
+        }
+    )
+    cfg = DualModelConfig.from_vllm_config(vllm_config)
+    assert cfg is not None
+    assert cfg.wave_batching is True
 
 
 def test_from_vllm_config_returns_none_when_additional_config_missing():
