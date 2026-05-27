@@ -668,9 +668,18 @@ class DualModelRunner:
             )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
+        # Sampling reads logits written by run_decode on self.decode_stream.
+        # Under green-context partitioning, decode_stream is an externally-
+        # created CUstream (via torch.cuda.get_stream_from_external), which
+        # torch's caching allocator does NOT track for cross-stream sync.
+        # Running sampling on the default stream therefore reads stale
+        # logits and trips a `vectorized_gather_kernel: index out of bounds`
+        # assert. Wrap on decode_stream so sampling kernels follow on the
+        # same stream, getting in-order execution for free.
         with _nvtx_range("decode_sample"):
-            with _temporary_async_outputs(self.decode_runner, self.async_outputs):
-                decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
+            with torch.cuda.stream(self.decode_stream):
+                with _temporary_async_outputs(self.decode_runner, self.async_outputs):
+                    decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
         embed_output = self.pending_embed_output
         embed_pool_output = None
         if self.pending_embed_needs_pool:
