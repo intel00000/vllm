@@ -2334,6 +2334,19 @@ class Scheduler(SchedulerInterface):
             return False
         parent = self.requests.get(parent_id)
         if parent is None:
+            # Defensive observability: with pair-dep enabled, an unknown
+            # parent_id almost always means the caller forgot to use the
+            # randomized id returned by LLMEngine.add_request. Without
+            # this log, the gate silently falls open and pair-dep
+            # becomes a no-op (this is exactly the bug that hid in
+            # scripts/profile_dual_model.py for all of port_validation,
+            # wave, DRR sweeps; see git history of this comment).
+            logger.warning_once(
+                "Pair-dep gate fail-open: parent_request_id=%r not in "
+                "self.requests. Caller likely passed an external id; "
+                "use the value returned by LLMEngine.add_request.",
+                parent_id,
+            )
             return False
         # Parent could be in any state; if already finished it's already
         # been / about to be _free_request'd. Treat finished == satisfied.
