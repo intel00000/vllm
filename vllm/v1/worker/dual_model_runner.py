@@ -648,20 +648,33 @@ class DualModelRunner:
         )
         self.pending_req_order = split_outputs.scheduled_req_order
 
-        def run_decode() -> ModelRunnerOutput | None:
+        # Each task records a CUDA event on its role's stream after the
+        # forward is enqueued. The main thread waits on those events
+        # before reading outputs -- see the comment in sample_tokens
+        # for the full rationale (torch's caching allocator does NOT
+        # track external green-ctx streams, so explicit event sync is
+        # required to avoid stale reads / illegal memory accesses on
+        # the main thread's subsequent operations).
+        def run_decode() -> tuple[ModelRunnerOutput | None, torch.cuda.Event]:
             with torch.cuda.stream(self.decode_stream):
                 with _nvtx_range("decode_execute"):
-                    return self.decode_runner.execute_model(
+                    out = self.decode_runner.execute_model(
                         split_outputs.decode,
                         intermediate_tensors=intermediate_tensors,
                     )
+                ev = torch.cuda.Event()
+                ev.record(self.decode_stream)
+            return out, ev
 
-        def run_embed() -> ModelRunnerOutput | None:
+        def run_embed() -> tuple[ModelRunnerOutput | None, torch.cuda.Event]:
             with torch.cuda.stream(self.embed_stream):
                 with _nvtx_range("embed_execute"):
-                    return self.embed_runner.execute_model(
+                    out = self.embed_runner.execute_model(
                         split_outputs.embed,
                     )
+                ev = torch.cuda.Event()
+                ev.record(self.embed_stream)
+            return out, ev
 
         has_decode_work = (
             split_outputs.decode.num_scheduled_tokens
@@ -706,10 +719,21 @@ class DualModelRunner:
             embed_future = (
                 self._embed_executor.submit(run_embed) if has_embed_work else None
             )
+        decode_event: torch.cuda.Event | None = None
+        embed_event: torch.cuda.Event | None = None
         if decode_future is not None:
-            decode_output = decode_future.result()
+            decode_output, decode_event = decode_future.result()
         if embed_future is not None:
-            embed_exec_output = embed_future.result()
+            embed_exec_output, embed_event = embed_future.result()
+
+        # Cross-stream sync: have the main thread's current stream wait
+        # for both role streams before any subsequent host or
+        # default-stream read of the outputs.
+        _main_stream = torch.cuda.current_stream()
+        if decode_event is not None:
+            _main_stream.wait_event(decode_event)
+        if embed_event is not None:
+            _main_stream.wait_event(embed_event)
 
         decode_needs_sample = decode_output is None and bool(
             split_outputs.decode.num_scheduled_tokens
@@ -727,15 +751,24 @@ class DualModelRunner:
                 # Pool() reads tensors produced by the embed forward on
                 # _embed_executor's thread and issues its own CUDA work.
                 # Run it on the same thread so cuBLAS / stream state stays
-                # consistent.
+                # consistent. Record an event after the pool and have
+                # the main stream wait on it before _resolve reads the
+                # output (same rationale as the decode/embed forward
+                # event sync above).
                 def _run_pool():
                     with torch.cuda.stream(self.embed_stream):
                         with _nvtx_range("embed_pool"):
                             with _temporary_async_outputs(
                                 self.embed_runner, self.async_outputs
                             ):
-                                return self.embed_runner.pool()
-                embed_pool_output = self._embed_executor.submit(_run_pool).result()
+                                out = self.embed_runner.pool()
+                        ev = torch.cuda.Event()
+                        ev.record(self.embed_stream)
+                    return out, ev
+                embed_pool_output, embed_pool_event = (
+                    self._embed_executor.submit(_run_pool).result()
+                )
+                torch.cuda.current_stream().wait_event(embed_pool_event)
                 embed_output = _resolve_model_runner_output(
                     embed_pool_output,
                     "embed_output_get",
@@ -761,13 +794,28 @@ class DualModelRunner:
         # See the long comment at the top of execute_model for why the
         # per-role single-worker executor pinning matters under green
         # contexts.
+        # Each role's executor task records a CUDA event on its stream
+        # after the work is enqueued, and returns (output, event). After
+        # we collect both futures we explicitly wait for those events on
+        # the current (main-thread) stream before reading the outputs.
+        # This is the cross-stream sync the OLD heterobatch tree had at
+        # commit 6f1d6321c -- torch's caching allocator does NOT track
+        # external (green-ctx) streams, so without these waits the main
+        # thread can read tensors that decode_stream/embed_stream have
+        # not finished writing. Symptoms ranged from
+        # vectorized_gather_kernel index-out-of-bounds (sampling reads
+        # stale logits) to cudaErrorIllegalAddress inside the async D2H
+        # copy of sampled token ids.
         def _run_sample():
             with torch.cuda.stream(self.decode_stream):
                 with _nvtx_range("decode_sample"):
                     with _temporary_async_outputs(
                         self.decode_runner, self.async_outputs
                     ):
-                        return self.decode_runner.sample_tokens(grammar_output)
+                        out = self.decode_runner.sample_tokens(grammar_output)
+                ev = torch.cuda.Event()
+                ev.record(self.decode_stream)
+            return out, ev
         decode_sample_future = self._decode_executor.submit(_run_sample)
 
         embed_pool_future = None
@@ -778,13 +826,28 @@ class DualModelRunner:
                         with _temporary_async_outputs(
                             self.embed_runner, self.async_outputs
                         ):
-                            return self.embed_runner.pool()
+                            out = self.embed_runner.pool()
+                    ev = torch.cuda.Event()
+                    ev.record(self.embed_stream)
+                return out, ev
             embed_pool_future = self._embed_executor.submit(_run_pool)
 
-        decode_sample_output = decode_sample_future.result()
-        embed_pool_output = (
-            embed_pool_future.result() if embed_pool_future is not None else None
-        )
+        decode_sample_output, decode_sample_event = decode_sample_future.result()
+        if embed_pool_future is not None:
+            embed_pool_output, embed_pool_event = embed_pool_future.result()
+        else:
+            embed_pool_output, embed_pool_event = None, None
+
+        # Make the current (main-thread default) stream wait for both
+        # role streams to complete before we proceed to resolve / merge
+        # outputs. Without this, downstream reads -- including the
+        # GPUModelRunner's internal async D2H of sampled token ids --
+        # may race against still-pending decode/embed work.
+        _main_stream = torch.cuda.current_stream()
+        _main_stream.wait_event(decode_sample_event)
+        if embed_pool_event is not None:
+            _main_stream.wait_event(embed_pool_event)
+
         embed_output = self.pending_embed_output
         decode_output = _resolve_model_runner_output(
             decode_sample_output,
