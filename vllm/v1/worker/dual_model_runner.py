@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import inspect
 import os
@@ -317,7 +318,60 @@ class DualModelRunner:
         self.decode_kv_cache_spec: dict[str, Any] = {}
         self.embed_kv_cache_spec: dict[str, Any] = {}
 
+        # Per-role single-worker thread pools. Each pool keeps exactly
+        # ONE long-lived Python thread, so each role's CUDA work always
+        # runs on the same thread. That matters because cuBLAS handles
+        # are keyed by (thread, device): pinning the role to its own
+        # thread lets cuBLAS bind its handle to the role's stream
+        # (default OR green-context partition) once, and keep it bound
+        # without context-switching state on every step. Without this,
+        # alternating green-ctx streams on a single thread trips
+        # CUBLAS_STATUS_EXECUTION_FAILED at scale.
+        self._decode_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dual_decode"
+        )
+        self._embed_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dual_embed"
+        )
+        # Warm each thread: set device + issue a tiny matmul under the
+        # role's CURRENT stream (full or partitioned). This forces
+        # torch to lazy-init the per-thread cuBLAS handle now, bound
+        # to the role's stream, before any real forward call.
+        self._warm_role_thread(
+            self._decode_executor, self.decode_stream, self.device
+        )
+        self._warm_role_thread(
+            self._embed_executor, self.embed_stream, self.device
+        )
+
+    @staticmethod
+    def _warm_role_thread(
+        executor: concurrent.futures.ThreadPoolExecutor,
+        stream: torch.cuda.Stream,
+        device: torch.device,
+    ) -> None:
+        """Touch CUDA on the executor's worker thread so cuBLAS creates
+        its per-thread handle now (bound to ``stream``)."""
+        def _warm():
+            torch.cuda.set_device(device)
+            with torch.cuda.stream(stream):
+                a = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
+                b = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
+                _ = torch.matmul(a, b)
+                torch.cuda.current_stream().synchronize()
+        executor.submit(_warm).result()
+
     def __del__(self):
+        # Best-effort: shut down the per-role executors. Non-blocking
+        # so we don't deadlock on tasks that might be in flight at
+        # interpreter shutdown.
+        for attr in ("_decode_executor", "_embed_executor"):
+            executor = getattr(self, attr, None)
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
         # Best-effort: free green-context handles. Streams created from
         # them are torch.cuda.ExternalStream (no automatic cleanup), so
         # the contexts must outlive any stream use; this is called only
@@ -542,7 +596,21 @@ class DualModelRunner:
         )
 
     def capture_model(self) -> int:
-        return self.decode_runner.capture_model() + self.embed_runner.capture_model()
+        # Dispatch each capture to the role's dedicated executor thread.
+        # Critical for green-context: the per-thread cuBLAS handle is what
+        # gets recorded into the captured graphs (graph_capture itself uses
+        # an internal stream, but the cuBLAS handle is thread-local). Later
+        # execute_model also runs on the role's executor thread (see T3),
+        # so the capturing and replaying threads -- and their cuBLAS state --
+        # match. Mismatched threads here would resurface as
+        # CUBLAS_STATUS_EXECUTION_FAILED at first replay.
+        decode_future = self._decode_executor.submit(
+            self.decode_runner.capture_model
+        )
+        embed_future = self._embed_executor.submit(
+            self.embed_runner.capture_model
+        )
+        return decode_future.result() + embed_future.result()
 
     def _dummy_run(self, *args, **kwargs):
         return self.decode_runner._dummy_run(*args, **kwargs)
@@ -619,16 +687,29 @@ class DualModelRunner:
         decode_output = None
         embed_exec_output = None
         embed_output: ModelRunnerOutput | None = None
+        # Dispatch each role to its dedicated executor so cuBLAS's
+        # per-thread handle stays pinned to the role's stream. Both
+        # tasks run concurrently on the GPU when both have work.
+        # execute_order only affects which task is submitted first --
+        # CPU-side ordering, not GPU scheduling.
         if self.execute_order == "embed_first":
-            if has_embed_work:
-                embed_exec_output = run_embed()
-            if has_decode_work:
-                decode_output = run_decode()
+            embed_future = (
+                self._embed_executor.submit(run_embed) if has_embed_work else None
+            )
+            decode_future = (
+                self._decode_executor.submit(run_decode) if has_decode_work else None
+            )
         else:
-            if has_decode_work:
-                decode_output = run_decode()
-            if has_embed_work:
-                embed_exec_output = run_embed()
+            decode_future = (
+                self._decode_executor.submit(run_decode) if has_decode_work else None
+            )
+            embed_future = (
+                self._embed_executor.submit(run_embed) if has_embed_work else None
+            )
+        if decode_future is not None:
+            decode_output = decode_future.result()
+        if embed_future is not None:
+            embed_exec_output = embed_future.result()
 
         decode_needs_sample = decode_output is None and bool(
             split_outputs.decode.num_scheduled_tokens
@@ -643,12 +724,18 @@ class DualModelRunner:
 
         if has_embed_work:
             if embed_exec_output is None:
-                with torch.cuda.stream(self.embed_stream):
-                    with _nvtx_range("embed_pool"):
-                        with _temporary_async_outputs(
-                            self.embed_runner, self.async_outputs
-                        ):
-                            embed_pool_output = self.embed_runner.pool()
+                # Pool() reads tensors produced by the embed forward on
+                # _embed_executor's thread and issues its own CUDA work.
+                # Run it on the same thread so cuBLAS / stream state stays
+                # consistent.
+                def _run_pool():
+                    with torch.cuda.stream(self.embed_stream):
+                        with _nvtx_range("embed_pool"):
+                            with _temporary_async_outputs(
+                                self.embed_runner, self.async_outputs
+                            ):
+                                return self.embed_runner.pool()
+                embed_pool_output = self._embed_executor.submit(_run_pool).result()
                 embed_output = _resolve_model_runner_output(
                     embed_pool_output,
                     "embed_output_get",
@@ -668,27 +755,37 @@ class DualModelRunner:
             )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
-        # Sampling reads logits written by run_decode on self.decode_stream.
-        # Under green-context partitioning, decode_stream is an externally-
-        # created CUstream (via torch.cuda.get_stream_from_external), which
-        # torch's caching allocator does NOT track for cross-stream sync.
-        # Running sampling on the default stream therefore reads stale
-        # logits and trips a `vectorized_gather_kernel: index out of bounds`
-        # assert. Wrap on decode_stream so sampling kernels follow on the
-        # same stream, getting in-order execution for free.
-        with _nvtx_range("decode_sample"):
+        # Run sampling on the decode role's dedicated executor thread,
+        # which keeps cuBLAS / stream state aligned with the preceding
+        # run_decode forward. Pool likewise runs on the embed thread.
+        # See the long comment at the top of execute_model for why the
+        # per-role single-worker executor pinning matters under green
+        # contexts.
+        def _run_sample():
             with torch.cuda.stream(self.decode_stream):
-                with _temporary_async_outputs(self.decode_runner, self.async_outputs):
-                    decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
-        embed_output = self.pending_embed_output
-        embed_pool_output = None
-        if self.pending_embed_needs_pool:
-            with torch.cuda.stream(self.embed_stream):
-                with _nvtx_range("embed_pool"):
+                with _nvtx_range("decode_sample"):
                     with _temporary_async_outputs(
-                        self.embed_runner, self.async_outputs
+                        self.decode_runner, self.async_outputs
                     ):
-                        embed_pool_output = self.embed_runner.pool()
+                        return self.decode_runner.sample_tokens(grammar_output)
+        decode_sample_future = self._decode_executor.submit(_run_sample)
+
+        embed_pool_future = None
+        if self.pending_embed_needs_pool:
+            def _run_pool():
+                with torch.cuda.stream(self.embed_stream):
+                    with _nvtx_range("embed_pool"):
+                        with _temporary_async_outputs(
+                            self.embed_runner, self.async_outputs
+                        ):
+                            return self.embed_runner.pool()
+            embed_pool_future = self._embed_executor.submit(_run_pool)
+
+        decode_sample_output = decode_sample_future.result()
+        embed_pool_output = (
+            embed_pool_future.result() if embed_pool_future is not None else None
+        )
+        embed_output = self.pending_embed_output
         decode_output = _resolve_model_runner_output(
             decode_sample_output,
             "decode_output_get",
