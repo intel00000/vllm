@@ -255,8 +255,13 @@ class LLMEngine:
         # Pair-dep gating: stash parent_request_id onto the
         # EngineCoreRequest so the scheduler's
         # _should_gate_child_on_parent can hold this request in
-        # _gated_children until the parent finishes. No-op when
-        # parent_request_id is None.
+        # _gated_children until the parent finishes. The value MUST be
+        # the parent's internal randomized request_id (i.e. the value
+        # that this method RETURNED for the parent's add_request call),
+        # not the caller's external id -- the scheduler keys
+        # self.requests by request_id. If the caller passes an external
+        # id here, the gate fail-opens silently and pair-dep becomes a
+        # no-op.
         if parent_request_id is not None:
             request.parent_request_id = parent_request_id
 
