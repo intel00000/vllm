@@ -32,11 +32,12 @@ from vllm.v1.worker.work_stream import (
 )
 
 
-def _fake_vllm_config(dual: bool):
+def _fake_vllm_config(dual: bool, enforce_eager: bool = True):
     cfg = MagicMock()
     cfg.additional_config = (
         {"dual_model": {"embed_model": "BAAI/bge-large-en-v1.5"}} if dual else None
     )
+    cfg.model_config.enforce_eager = enforce_eager
     return cfg
 
 
@@ -188,6 +189,13 @@ def test_libsmctrl_rejects_zero_tpc():
     ):
         with pytest.raises(ValueError, match="0 TPCs"):
             LibsmctrlWorkStream(torch.device("cuda:0"), 1, 108)
+
+
+def test_make_work_streams_libsmctrl_requires_enforce_eager(monkeypatch):
+    monkeypatch.setenv(ENV_BACKEND, "libsmctrl")
+    cfg = _fake_vllm_config(dual=False, enforce_eager=False)
+    with pytest.raises(RuntimeError, match="enforce_eager"):
+        make_work_streams(cfg, torch.device("cuda:0"))
 
 
 def test_libsmctrl_rejects_oversized():
