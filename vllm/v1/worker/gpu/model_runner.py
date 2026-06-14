@@ -413,6 +413,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Cache the default CUDA stream to avoid lookup overhead.
         return torch.cuda.current_stream(self.device)
 
+    def bind_main_stream(self, stream: torch.cuda.Stream) -> None:
+        """Preempt the ``main_stream`` cached_property with ``stream``.
+
+        Async-output paths use ``output_copy_stream.wait_stream(main_stream)``
+        to gate the D2H of sampled token ids on the forward-pass work.  If
+        ``main_stream`` is first accessed before the worker's WorkStream
+        wrap takes effect, the cached value is the device default stream
+        and the wait does not actually synchronize against the partitioned
+        stream where the model ran -- producing ``cudaErrorIllegalAddress``
+        on A100 and similar races on H200.  Calling this from
+        ``Worker.init_device`` immediately after ``make_work_streams``
+        pre-populates the cache with the WorkStream's stream so the
+        wait_stream is correct from the first forward pass.
+        """
+        self.__dict__["main_stream"] = stream
+
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
