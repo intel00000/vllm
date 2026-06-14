@@ -57,6 +57,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.work_stream import WorkStream, make_work_streams
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -208,6 +209,13 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+
+        # WorkStream(s) populated in init_device once self.device is set.
+        # Primary covers worker-level orchestration + the model_runner
+        # call; aux is the embed-side WorkStream for DualModelRunner
+        # (None for single-model deployments).
+        self._work_stream: WorkStream | None = None
+        self._aux_work_stream: WorkStream | None = None
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -370,6 +378,13 @@ class Worker(WorkerBase):
             self.vllm_config, self.use_v2_model_runner
         )
         self.model_runner: GPUModelRunner = runner_cls(  # type: ignore
+            self.vllm_config, self.device
+        )
+
+        # Build worker-owned WorkStream(s) from env vars.  Stored but not
+        # yet wrapped around capture_model / execute_model / sample_tokens
+        # -- that wiring lands in WS3 alongside DualModelRunner integration.
+        self._work_stream, self._aux_work_stream = make_work_streams(
             self.vllm_config, self.device
         )
 
@@ -1210,6 +1225,12 @@ class Worker(WorkerBase):
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+
+        for ws in (self._work_stream, self._aux_work_stream):
+            if ws is not None:
+                ws.close()
+        self._work_stream = None
+        self._aux_work_stream = None
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
