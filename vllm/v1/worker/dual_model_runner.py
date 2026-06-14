@@ -88,105 +88,6 @@ def _resolve_model_runner_output(
     return output
 
 
-def _create_disjoint_green_streams(
-    device: torch.device,
-    device_index: int,
-    decode_sms_target: int,
-    embed_sms_target: int,
-    total_sms: int,
-) -> tuple[torch.cuda.Stream, torch.cuda.Stream, int, int, list[Any]]:
-    """Create two CUDA Green Context streams with disjoint SM partitions.
-
-    Uses ``flashinfer.green_ctx`` building blocks (``split_resource`` +
-    ``create_green_ctx_streams``) under a *peel-then-remainder* policy so
-    that the embed partition exactly fits whatever SMs are left after the
-    decode peel. This avoids ``flashinfer.green_ctx.split_device_green_ctx_by_sm_count``,
-    which rounds **each** requested count up independently to the 8-SM
-    alignment — e.g. ``[40, 92]`` becomes ``[40, 96]`` and 40+96 > 132
-    fails with ``CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION``.
-
-    PyTorch's bare ``torch.cuda.GreenContext.create(num_sms)`` does NOT
-    coordinate disjoint allocation across calls — two consecutive calls
-    can yield green contexts whose SM resources overlap, producing a
-    deferred ``vectorized_gather_kernel`` index-out-of-bounds assert
-    when used concurrently. The peel-then-remainder split below is
-    guaranteed disjoint by the driver's split semantics.
-
-    ``embed_sms_target`` is informational only — embed gets exactly what
-    is left after decode is peeled.
-
-    Returns:
-        decode_stream:     torch.cuda.Stream on the decode SM partition.
-        embed_stream:      torch.cuda.Stream on the embed SM partition.
-        actual_decode_sms: SM count actually realized for decode.
-        actual_embed_sms:  SM count realized for embed.
-        green_ctx_handles: kept for API compatibility; flashinfer manages
-            green-ctx lifetime via the returned streams, so this is empty.
-    """
-    try:
-        from flashinfer.green_ctx import (
-            create_green_ctx_streams,
-            get_cudevice,
-            get_device_resource,
-            split_resource,
-        )
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError(
-            "flashinfer is required for dual-model green-context partitioning. "
-            "Install with `pip install flashinfer-python`."
-        ) from e
-
-    cu_dev = get_cudevice(device)
-    primary = get_device_resource(cu_dev)
-    decode_list, remaining = split_resource(primary, 1, decode_sms_target)
-    if not decode_list or decode_list[0].sm.smCount == 0:
-        raise RuntimeError(
-            f"Could not peel off {decode_sms_target} SMs for decode partition "
-            f"from primary resource of {primary.sm.smCount} SMs"
-        )
-    decode_res = decode_list[0]
-    if remaining.sm.smCount == 0:
-        raise RuntimeError(
-            f"No SMs remaining for embed partition after taking "
-            f"{decode_res.sm.smCount} for decode"
-        )
-
-    streams = create_green_ctx_streams(cu_dev, [decode_res, remaining])
-    decode_stream = streams[0]
-    embed_stream = streams[1]
-    actual_decode_sms = int(decode_res.sm.smCount)
-    actual_embed_sms = int(remaining.sm.smCount)
-    if actual_decode_sms + actual_embed_sms > total_sms:
-        raise RuntimeError(
-            f"Green-context partitions overlap: decode={actual_decode_sms} + "
-            f"embed={actual_embed_sms} > total {total_sms}"
-        )
-    return (
-        decode_stream,
-        embed_stream,
-        actual_decode_sms,
-        actual_embed_sms,
-        [],  # flashinfer manages green-ctx lifetime via the streams
-    )
-
-
-def _destroy_green_contexts(handles: list[Any]) -> None:
-    """Cleanup hook — flashinfer manages green-ctx lifetime via the streams,
-    so the handles list is empty under the new implementation. Kept for
-    backwards-compatible call sites."""
-    if not handles:
-        return
-    try:
-        from cuda.bindings import driver as drv
-    except ImportError:
-        return
-    for ctx in handles:
-        try:
-            drv.cuGreenCtxDestroy(ctx)
-        except Exception:
-            pass
-
-
 class DualModelRunner:
     """Experimental wrapper that hosts one decode and one embed runner."""
 
@@ -207,92 +108,17 @@ class DualModelRunner:
             raise ValueError(
                 "DualModelRunner currently does not support speculative decoding."
             )
-        # Full-GPU streams (used in solo phases or when SM partitioning is off).
-        self._decode_stream_full = torch.cuda.default_stream(device)
-        stream_mode = os.environ.get("VLLM_DUAL_MODEL_STREAM_MODE", "two_stream")
-        if stream_mode == "default_stream":
-            self._embed_stream_full = self._decode_stream_full
-        elif stream_mode == "two_stream":
-            self._embed_stream_full = torch.cuda.Stream(device)
-        else:
-            raise ValueError(
-                "VLLM_DUAL_MODEL_STREAM_MODE must be 'two_stream' or "
-                f"'default_stream', got {stream_mode!r}."
-            )
 
-        # Optional CUDA Green Context partitioning: when both
-        # VLLM_DUAL_DECODE_SMS and VLLM_DUAL_EMBED_SMS are set, create
-        # *disjoint* green contexts per role and route mixed-step kernels
-        # through them. In solo steps (only decode or only embed has work)
-        # we fall back to the full-GPU streams so we don't waste SMs.
-        #
-        # NOTE: We deliberately do NOT use ``torch.cuda.GreenContext.create``
-        # here. PyTorch's wrapper calls ``cuGreenCtxCreate`` per-invocation
-        # with no cross-call coordination, so two separate calls can return
-        # green contexts that share underlying SMs. When both contexts are
-        # active concurrently (mixed phase), kernels on different streams
-        # end up scheduled on the same physical SMs, racing in shared
-        # memory / L2 / register state. This manifests as a deferred
-        # ``vectorized_gather_kernel`` index-out-of-bounds assert at full
-        # scale — the kernel reads stale tensor data corrupted by the race.
-        # Instead, we use the CUDA Driver API directly via ``cuda-python``
-        # to perform a single split of the device's SM resource, then
-        # combine sub-resources to build two *guaranteed-disjoint*
-        # descriptors before creating each green context.
-        self._decode_stream_partitioned = None
-        self._embed_stream_partitioned = None
-        self._partition_sm_decode = None
-        self._partition_sm_embed = None
-        self._green_ctx_handles: list[Any] = []  # for cleanup
-        sm_decode_env = os.environ.get("VLLM_DUAL_DECODE_SMS", "").strip()
-        sm_embed_env = os.environ.get("VLLM_DUAL_EMBED_SMS", "").strip()
-        if sm_decode_env and sm_embed_env:
-            sm_decode = int(sm_decode_env)
-            sm_embed = int(sm_embed_env)
-            total_sms = torch.cuda.get_device_properties(device).multi_processor_count
-            if sm_decode <= 0 or sm_decode > total_sms:
-                raise ValueError(
-                    f"VLLM_DUAL_DECODE_SMS={sm_decode} out of range (1..{total_sms})"
-                )
-            if sm_embed <= 0 or sm_embed > total_sms:
-                raise ValueError(
-                    f"VLLM_DUAL_EMBED_SMS={sm_embed} out of range (1..{total_sms})"
-                )
-            device_index = device.index if device.index is not None else 0
-            (
-                self._decode_stream_partitioned,
-                self._embed_stream_partitioned,
-                actual_decode_sms,
-                actual_embed_sms,
-                self._green_ctx_handles,
-            ) = _create_disjoint_green_streams(
-                device, device_index, sm_decode, sm_embed, total_sms
-            )
-            self._partition_sm_decode = actual_decode_sms
-            self._partition_sm_embed = actual_embed_sms
-            logger.info(
-                "DualModelRunner green-ctx partition: decode=%d/%d SMs (requested %d), "
-                "embed=%d/%d SMs (requested %d) — disjoint via cuDevSmResourceSplitByCount",
-                actual_decode_sms, total_sms, sm_decode,
-                actual_embed_sms, total_sms, sm_embed,
-            )
-
-        # Initial stream binding: default to full streams. Mixed steps swap
-        # to the partitioned streams inside execute_model when partitioning
-        # is enabled.  When the worker calls ``set_work_streams`` (the
-        # WorkStream path), these get overwritten and the legacy swap
-        # logic is bypassed.
-        self.decode_stream = self._decode_stream_full
-        self.embed_stream = self._embed_stream_full
-
-        # WorkStream refs the worker installs via ``set_work_streams``.
-        # ``None`` keeps the legacy stream-wrap behaviour for any caller
-        # that bypasses Worker (tests, microbenches).  When set, all the
-        # ``_decode_ctx`` / ``_embed_ctx`` callsites delegate to the
-        # WorkStream so backend-specific setup (libsmctrl thread mask,
-        # green-ctx ExternalStream binding) fires uniformly.
+        # WorkStreams are populated when the worker calls
+        # ``set_work_streams``.  They are the single source of stream
+        # identity for both roles -- ``execute_model`` / ``sample_tokens``
+        # require them to be set.  ``Worker.init_device`` wires them
+        # automatically after constructing the runner; direct callers
+        # must call ``set_work_streams`` themselves before executing.
         self._decode_ws: WorkStream | None = None
         self._embed_ws: WorkStream | None = None
+        self.decode_stream: torch.cuda.Stream | None = None
+        self.embed_stream: torch.cuda.Stream | None = None
 
         execute_order = os.environ.get("VLLM_DUAL_MODEL_EXECUTE_ORDER", "decode_first")
         if execute_order not in ("decode_first", "embed_first"):
@@ -330,57 +156,38 @@ class DualModelRunner:
         self.decode_kv_cache_spec: dict[str, Any] = {}
         self.embed_kv_cache_spec: dict[str, Any] = {}
 
-        # Per-role single-worker thread pools. Each pool keeps exactly
+        # Per-role single-worker thread pools.  Each pool keeps exactly
         # ONE long-lived Python thread, so each role's CUDA work always
-        # runs on the same thread. That matters because cuBLAS handles
+        # runs on the same thread.  That matters because cuBLAS handles
         # are keyed by (thread, device): pinning the role to its own
-        # thread lets cuBLAS bind its handle to the role's stream
-        # (default OR green-context partition) once, and keep it bound
-        # without context-switching state on every step. Without this,
-        # alternating green-ctx streams on a single thread trips
-        # CUBLAS_STATUS_EXECUTION_FAILED at scale.
+        # thread lets cuBLAS bind its handle to the role's stream once
+        # and keep it bound without context-switching state on every
+        # step.  Without this, alternating green-ctx streams on a
+        # single thread trips CUBLAS_STATUS_EXECUTION_FAILED at scale.
+        # Each executor is warmed under its role's WorkStream context
+        # in :meth:`set_work_streams` (which the worker calls during
+        # init_device).
         self._decode_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="dual_decode"
         )
         self._embed_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="dual_embed"
         )
-        # Warm each thread: set device + issue a tiny matmul under the
-        # role's CURRENT stream (full or partitioned). This forces
-        # torch to lazy-init the per-thread cuBLAS handle now, bound
-        # to the role's stream, before any real forward call.
-        self._warm_role_thread(
-            self._decode_executor, self.decode_stream, self.device
-        )
-        self._warm_role_thread(
-            self._embed_executor, self.embed_stream, self.device
-        )
 
     @staticmethod
     def _warm_role_thread(
         executor: concurrent.futures.ThreadPoolExecutor,
-        stream: torch.cuda.Stream,
+        work_stream: WorkStream,
         device: torch.device,
-        work_stream: WorkStream | None = None,
     ) -> None:
-        """Touch CUDA on the executor's worker thread so cuBLAS creates
-        its per-thread handle now, bound to ``stream``.
-
-        When ``work_stream`` is provided, the warm runs under
-        ``work_stream.context()`` so any backend-specific per-thread
-        state (e.g. libsmctrl's TPC mask) gets installed on this
-        executor's thread during the warm itself.  Otherwise we fall
-        back to bare ``torch.cuda.stream(stream)`` for the legacy path.
-        """
-        ctx_factory = (
-            (lambda: work_stream.context())
-            if work_stream is not None
-            else (lambda: torch.cuda.stream(stream))
-        )
-
+        """Touch CUDA on the executor's worker thread under
+        ``work_stream.context()`` so cuBLAS creates its per-thread handle
+        bound to the WorkStream's stream, and any backend-specific
+        per-thread state (e.g. libsmctrl's TPC mask) gets installed on
+        this executor's thread before the first real forward."""
         def _warm():
             torch.cuda.set_device(device)
-            with ctx_factory():
+            with work_stream.context():
                 a = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
                 b = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
                 _ = torch.matmul(a, b)
@@ -418,31 +225,37 @@ class DualModelRunner:
         self.embed_stream = embed_ws.stream
         self.decode_runner.bind_main_stream(decode_ws.stream)
         self.embed_runner.bind_main_stream(embed_ws.stream)
-        # Rebind cuBLAS / per-thread state on each executor thread.
-        self._warm_role_thread(
-            self._decode_executor, decode_ws.stream, self.device, decode_ws
-        )
-        self._warm_role_thread(
-            self._embed_executor, embed_ws.stream, self.device, embed_ws
-        )
+        # Warm cuBLAS / per-thread state on each executor thread under
+        # the role's WorkStream context.
+        self._warm_role_thread(self._decode_executor, decode_ws, self.device)
+        self._warm_role_thread(self._embed_executor, embed_ws, self.device)
 
     def _decode_ctx(self):
-        """Context manager for decode-role CUDA work.  Routes through
-        ``_decode_ws.context()`` when the worker has wired one, else
-        falls back to bare ``torch.cuda.stream`` on ``decode_stream``."""
-        if self._decode_ws is not None:
-            return self._decode_ws.context()
-        return torch.cuda.stream(self.decode_stream)
+        """Context manager for decode-role CUDA work, routed through the
+        decode WorkStream installed by ``set_work_streams``."""
+        if self._decode_ws is None:
+            raise RuntimeError(
+                "DualModelRunner: set_work_streams() must be called "
+                "before execute_model() / sample_tokens().  "
+                "Worker.init_device wires this automatically; if you're "
+                "constructing DualModelRunner directly, build "
+                "WorkStreams via make_work_streams() and pass them in."
+            )
+        return self._decode_ws.context()
 
     def _embed_ctx(self):
-        if self._embed_ws is not None:
-            return self._embed_ws.context()
-        return torch.cuda.stream(self.embed_stream)
+        if self._embed_ws is None:
+            raise RuntimeError(
+                "DualModelRunner: set_work_streams() must be called "
+                "before execute_model() / sample_tokens()."
+            )
+        return self._embed_ws.context()
 
     def __del__(self):
         # Best-effort: shut down the per-role executors. Non-blocking
         # so we don't deadlock on tasks that might be in flight at
-        # interpreter shutdown.
+        # interpreter shutdown.  WorkStream lifetime is managed by the
+        # worker (Worker.shutdown -> WorkStream.close()).
         for attr in ("_decode_executor", "_embed_executor"):
             executor = getattr(self, attr, None)
             if executor is not None:
@@ -450,13 +263,6 @@ class DualModelRunner:
                     executor.shutdown(wait=False)
                 except Exception:
                     pass
-        # Best-effort: free green-context handles. Streams created from
-        # them are torch.cuda.ExternalStream (no automatic cleanup), so
-        # the contexts must outlive any stream use; this is called only
-        # when the runner itself goes away.
-        handles = getattr(self, "_green_ctx_handles", None)
-        if handles:
-            _destroy_green_contexts(handles)
 
     def __getattr__(self, name: str) -> Any:
         decode_runner = self.__dict__.get("decode_runner")
@@ -762,22 +568,6 @@ class DualModelRunner:
             split_outputs.embed.num_scheduled_tokens
             or split_outputs.embed.finished_req_ids
         )
-
-        # SM-partition stream selection (legacy path only -- when the
-        # worker installs WorkStreams via set_work_streams, those are
-        # fixed-identity and the dynamic swap below is bypassed):
-        # if green contexts are configured, use the partitioned streams
-        # when both roles have work in this step so kernels run on
-        # disjoint SM groups; otherwise use full-GPU streams.
-        if self._decode_ws is None:
-            if self._decode_stream_partitioned is not None and (
-                has_decode_work and has_embed_work
-            ):
-                self.decode_stream = self._decode_stream_partitioned
-                self.embed_stream = self._embed_stream_partitioned
-            else:
-                self.decode_stream = self._decode_stream_full
-                self.embed_stream = self._embed_stream_full
 
         decode_output = None
         embed_exec_output = None
