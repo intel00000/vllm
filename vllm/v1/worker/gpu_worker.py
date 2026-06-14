@@ -80,6 +80,7 @@ from vllm.v1.worker.startup_plan import (
     maybe_save_startup_plan,
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.work_stream import WorkStream, make_work_streams
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -229,6 +230,13 @@ class Worker(WorkerBase):
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
+
+        # WorkStream(s) populated in init_device once self.device is set.
+        # Primary covers worker-level orchestration + the model_runner
+        # call; aux is the embed-side WorkStream for DualModelRunner
+        # (None for single-model deployments).
+        self._work_stream: WorkStream | None = None
+        self._aux_work_stream: WorkStream | None = None
 
     def _get_sleep_mode_backend(self) -> "SleepModeBackend":
         if self._sleep_mode_backend is None:
@@ -456,6 +464,13 @@ class Worker(WorkerBase):
             self.vllm_config, self.use_v2_model_runner
         )
         self.model_runner: GPUModelRunner = runner_cls(  # type: ignore
+            self.vllm_config, self.device
+        )
+
+        # Build worker-owned WorkStream(s) from env vars.  Stored but not
+        # yet wrapped around capture_model / execute_model / sample_tokens
+        # -- that wiring lands in WS3 alongside DualModelRunner integration.
+        self._work_stream, self._aux_work_stream = make_work_streams(
             self.vllm_config, self.device
         )
 
@@ -1490,6 +1505,12 @@ class Worker(WorkerBase):
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+
+        for ws in (self._work_stream, self._aux_work_stream):
+            if ws is not None:
+                ws.close()
+        self._work_stream = None
+        self._aux_work_stream = None
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to
