@@ -381,12 +381,15 @@ class Worker(WorkerBase):
             self.vllm_config, self.device
         )
 
-        # Build worker-owned WorkStream(s) from env vars.  Stored but not
-        # yet wrapped around capture_model / execute_model / sample_tokens
-        # -- that wiring lands in WS3 alongside DualModelRunner integration.
+        # Build worker-owned WorkStream(s) from env vars and pre-populate
+        # the runner's main_stream cache so AsyncModelRunnerOutput's
+        # output_copy_stream.wait_stream(main_stream) actually waits for
+        # the WorkStream's work, not the device default stream.
         self._work_stream, self._aux_work_stream = make_work_streams(
             self.vllm_config, self.device
         )
+        if hasattr(self.model_runner, "bind_main_stream"):
+            self.model_runner.bind_main_stream(self._work_stream.stream)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -668,7 +671,7 @@ class Worker(WorkerBase):
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            cuda_graph_memory_bytes = self.capture_model()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -882,11 +885,20 @@ class Worker(WorkerBase):
             return self.profiler.annotate_context_manager(annotation)
         return torch.cuda.nvtx.range(annotation)
 
+    def capture_model(self) -> int:
+        """Wrap model_runner.capture_model() in the worker WorkStream so
+        cudagraph capture observes the partitioned stream identity."""
+        assert self._work_stream is not None
+        with self._work_stream.context():
+            return self.model_runner.capture_model()
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        assert self._work_stream is not None
+        with self._work_stream.context():
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     def execute_model(
@@ -948,7 +960,8 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
+        assert self._work_stream is not None
+        with self._work_stream.context(), self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
