@@ -455,6 +455,20 @@ def make_work_streams(
             f"${ENV_BACKEND}={backend!r} must be one of {_VALID_BACKENDS}"
         )
 
+    if backend == BACKEND_LIBSMCTRL:
+        # libsmctrl patches QMD bytes on the eager cuLaunchKernel path;
+        # the patch does NOT bake into cudagraph-captured nodes (verified
+        # in scripts/microbench/libsmctrl_cudagraph_smoke.py).  Replayed
+        # kernels would run with no SM mask, silently defeating the
+        # partition.  Fail fast at make_work_streams time so the user
+        # gets a clear error instead of "no walltime change" later.
+        if not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise RuntimeError(
+                f"${ENV_BACKEND}=libsmctrl requires enforce_eager=True "
+                "(the SM mask does not survive cudagraph capture).  Set "
+                "model_config.enforce_eager=True or pass --enforce-eager."
+            )
+
     is_dual = DualModelConfig.from_vllm_config(vllm_config) is not None
 
     if backend == BACKEND_NONE:
