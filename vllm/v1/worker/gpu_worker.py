@@ -470,11 +470,21 @@ class Worker(WorkerBase):
         # Build worker-owned WorkStream(s) from env vars and pre-populate
         # the runner's main_stream cache so AsyncModelRunnerOutput's
         # output_copy_stream.wait_stream(main_stream) actually waits for
-        # the WorkStream's work, not the device default stream.
+        # the WorkStream's work, not the device default stream.  For
+        # DualModelRunner the aux stream wires the embed side and the
+        # per-role executor threads get re-warmed under the WorkStream's
+        # context.
         self._work_stream, self._aux_work_stream = make_work_streams(
             self.vllm_config, self.device
         )
-        if hasattr(self.model_runner, "bind_main_stream"):
+        if (
+            self._aux_work_stream is not None
+            and hasattr(self.model_runner, "set_work_streams")
+        ):
+            self.model_runner.set_work_streams(
+                self._work_stream, self._aux_work_stream
+            )
+        elif hasattr(self.model_runner, "bind_main_stream"):
             self.model_runner.bind_main_stream(self._work_stream.stream)
 
         if self.rank == 0:

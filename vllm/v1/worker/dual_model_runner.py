@@ -31,6 +31,7 @@ from vllm.v1.worker.dual_model_helpers import (
     split_scheduler_output_by_model,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.work_stream import WorkStream
 
 logger = init_logger(__name__)
 
@@ -278,9 +279,20 @@ class DualModelRunner:
 
         # Initial stream binding: default to full streams. Mixed steps swap
         # to the partitioned streams inside execute_model when partitioning
-        # is enabled.
+        # is enabled.  When the worker calls ``set_work_streams`` (the
+        # WorkStream path), these get overwritten and the legacy swap
+        # logic is bypassed.
         self.decode_stream = self._decode_stream_full
         self.embed_stream = self._embed_stream_full
+
+        # WorkStream refs the worker installs via ``set_work_streams``.
+        # ``None`` keeps the legacy stream-wrap behaviour for any caller
+        # that bypasses Worker (tests, microbenches).  When set, all the
+        # ``_decode_ctx`` / ``_embed_ctx`` callsites delegate to the
+        # WorkStream so backend-specific setup (libsmctrl thread mask,
+        # green-ctx ExternalStream binding) fires uniformly.
+        self._decode_ws: WorkStream | None = None
+        self._embed_ws: WorkStream | None = None
 
         execute_order = os.environ.get("VLLM_DUAL_MODEL_EXECUTE_ORDER", "decode_first")
         if execute_order not in ("decode_first", "embed_first"):
@@ -349,17 +361,83 @@ class DualModelRunner:
         executor: concurrent.futures.ThreadPoolExecutor,
         stream: torch.cuda.Stream,
         device: torch.device,
+        work_stream: WorkStream | None = None,
     ) -> None:
         """Touch CUDA on the executor's worker thread so cuBLAS creates
-        its per-thread handle now (bound to ``stream``)."""
+        its per-thread handle now, bound to ``stream``.
+
+        When ``work_stream`` is provided, the warm runs under
+        ``work_stream.context()`` so any backend-specific per-thread
+        state (e.g. libsmctrl's TPC mask) gets installed on this
+        executor's thread during the warm itself.  Otherwise we fall
+        back to bare ``torch.cuda.stream(stream)`` for the legacy path.
+        """
+        ctx_factory = (
+            (lambda: work_stream.context())
+            if work_stream is not None
+            else (lambda: torch.cuda.stream(stream))
+        )
+
         def _warm():
             torch.cuda.set_device(device)
-            with torch.cuda.stream(stream):
+            with ctx_factory():
                 a = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
                 b = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
                 _ = torch.matmul(a, b)
                 torch.cuda.current_stream().synchronize()
         executor.submit(_warm).result()
+
+    def bind_main_stream(self, stream: torch.cuda.Stream) -> None:
+        """Preempt the decode runner's ``main_stream`` cache.
+
+        Called from ``Worker.init_device`` with the primary WorkStream's
+        stream so the decode-side async D2H paths sync correctly.  The
+        embed runner gets its own ``main_stream`` binding inside
+        :meth:`set_work_streams`.
+        """
+        self.decode_runner.bind_main_stream(stream)
+
+    def set_work_streams(
+        self,
+        decode_ws: WorkStream,
+        embed_ws: WorkStream,
+    ) -> None:
+        """Wire decode + embed WorkStream(s) from the worker.
+
+        Overrides the legacy full / partitioned stream-swap logic in
+        ``execute_model``; from this point on, role work always runs in
+        the corresponding WorkStream's context.  Re-warms each role
+        executor thread under the new context so cuBLAS rebinds its
+        per-thread handle to the WorkStream's stream (and any
+        backend-specific per-thread state -- libsmctrl mask -- gets
+        installed before the first real forward).
+        """
+        self._decode_ws = decode_ws
+        self._embed_ws = embed_ws
+        self.decode_stream = decode_ws.stream
+        self.embed_stream = embed_ws.stream
+        self.decode_runner.bind_main_stream(decode_ws.stream)
+        self.embed_runner.bind_main_stream(embed_ws.stream)
+        # Rebind cuBLAS / per-thread state on each executor thread.
+        self._warm_role_thread(
+            self._decode_executor, decode_ws.stream, self.device, decode_ws
+        )
+        self._warm_role_thread(
+            self._embed_executor, embed_ws.stream, self.device, embed_ws
+        )
+
+    def _decode_ctx(self):
+        """Context manager for decode-role CUDA work.  Routes through
+        ``_decode_ws.context()`` when the worker has wired one, else
+        falls back to bare ``torch.cuda.stream`` on ``decode_stream``."""
+        if self._decode_ws is not None:
+            return self._decode_ws.context()
+        return torch.cuda.stream(self.decode_stream)
+
+    def _embed_ctx(self):
+        if self._embed_ws is not None:
+            return self._embed_ws.context()
+        return torch.cuda.stream(self.embed_stream)
 
     def __del__(self):
         # Best-effort: shut down the per-role executors. Non-blocking
@@ -656,7 +734,7 @@ class DualModelRunner:
         # required to avoid stale reads / illegal memory accesses on
         # the main thread's subsequent operations).
         def run_decode() -> tuple[ModelRunnerOutput | None, torch.cuda.Event]:
-            with torch.cuda.stream(self.decode_stream):
+            with self._decode_ctx():
                 with _nvtx_range("decode_execute"):
                     out = self.decode_runner.execute_model(
                         split_outputs.decode,
@@ -667,7 +745,7 @@ class DualModelRunner:
             return out, ev
 
         def run_embed() -> tuple[ModelRunnerOutput | None, torch.cuda.Event]:
-            with torch.cuda.stream(self.embed_stream):
+            with self._embed_ctx():
                 with _nvtx_range("embed_execute"):
                     out = self.embed_runner.execute_model(
                         split_outputs.embed,
@@ -685,17 +763,21 @@ class DualModelRunner:
             or split_outputs.embed.finished_req_ids
         )
 
-        # SM-partition stream selection: if green contexts are configured,
-        # use the partitioned streams when both roles have work in this step
-        # so kernels run on disjoint SM groups; otherwise use full-GPU streams.
-        if self._decode_stream_partitioned is not None and (
-            has_decode_work and has_embed_work
-        ):
-            self.decode_stream = self._decode_stream_partitioned
-            self.embed_stream = self._embed_stream_partitioned
-        else:
-            self.decode_stream = self._decode_stream_full
-            self.embed_stream = self._embed_stream_full
+        # SM-partition stream selection (legacy path only -- when the
+        # worker installs WorkStreams via set_work_streams, those are
+        # fixed-identity and the dynamic swap below is bypassed):
+        # if green contexts are configured, use the partitioned streams
+        # when both roles have work in this step so kernels run on
+        # disjoint SM groups; otherwise use full-GPU streams.
+        if self._decode_ws is None:
+            if self._decode_stream_partitioned is not None and (
+                has_decode_work and has_embed_work
+            ):
+                self.decode_stream = self._decode_stream_partitioned
+                self.embed_stream = self._embed_stream_partitioned
+            else:
+                self.decode_stream = self._decode_stream_full
+                self.embed_stream = self._embed_stream_full
 
         decode_output = None
         embed_exec_output = None
@@ -756,7 +838,7 @@ class DualModelRunner:
                 # output (same rationale as the decode/embed forward
                 # event sync above).
                 def _run_pool():
-                    with torch.cuda.stream(self.embed_stream):
+                    with self._embed_ctx():
                         with _nvtx_range("embed_pool"):
                             with _temporary_async_outputs(
                                 self.embed_runner, self.async_outputs
@@ -807,7 +889,7 @@ class DualModelRunner:
         # stale logits) to cudaErrorIllegalAddress inside the async D2H
         # copy of sampled token ids.
         def _run_sample():
-            with torch.cuda.stream(self.decode_stream):
+            with self._decode_ctx():
                 with _nvtx_range("decode_sample"):
                     with _temporary_async_outputs(
                         self.decode_runner, self.async_outputs
@@ -821,7 +903,7 @@ class DualModelRunner:
         embed_pool_future = None
         if self.pending_embed_needs_pool:
             def _run_pool():
-                with torch.cuda.stream(self.embed_stream):
+                with self._embed_ctx():
                     with _nvtx_range("embed_pool"):
                         with _temporary_async_outputs(
                             self.embed_runner, self.async_outputs
