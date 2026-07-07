@@ -2332,8 +2332,10 @@ class Scheduler(SchedulerInterface):
         else:
             model_breakdown = ""
 
-        if self._decision_log_level >= 2:
+        if self._decision_log_level == 2:
             # VERBOSE: full per-request lists (original commit-6 format).
+            # Level 2 ONLY -- level 3 is compact + the KV line above (verbose
+            # per-request lists would flood ~running ids per step).
             logger.info(
                 "[sched step=%d budget=%d/%d running=%d waiting=%d%s] "
                 "admit=%s defer=%s skip=%s preempt=%s",
