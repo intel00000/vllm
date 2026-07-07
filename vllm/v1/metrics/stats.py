@@ -198,6 +198,22 @@ class SchedulerStats:
     kv_cache_usage: float = 0.0
     iteration_details: SchedulerIterationDetails | None = None
 
+    # Dual-model (RAG decode+embed) per-step breakdown. Running/waiting counts
+    # come from the scheduler's in-process counters (always populated for
+    # dual-model). The KV block split (decode vs embed) + free blocks are
+    # populated only under HB_SCHEDULER_DECISION_LOG=3 (the level-3 KV
+    # breakdown; it needs an O(running) get_blocks walk). All zero on
+    # single-model runs or below level 3.
+    num_running_decode_reqs: int = 0
+    num_running_embed_reqs: int = 0
+    num_waiting_decode_reqs: int = 0
+    num_waiting_embed_reqs: int = 0
+    kv_blocks_decode: int = 0
+    kv_blocks_embed: int = 0
+    kv_blocks_free: int = 0
+    kv_blocks_used: int = 0  # blocks not in the free queue (live); reconciles
+    #                          with kv_blocks_decode+embed (owned by running)
+
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
 
