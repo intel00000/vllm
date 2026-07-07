@@ -130,6 +130,15 @@ class DualModelRunner:
         self.async_outputs = os.environ.get(
             "VLLM_DUAL_MODEL_ASYNC_OUTPUTS", "0"
         ).lower() in ("1", "true", "yes", "on")
+        # Sequential baseline for the latency experiment: run one role per step,
+        # GPU-serialized (never decode ∥ embed). When set, execute_model runs
+        # the two role forwards back-to-back with a device-side wait between
+        # them so their kernels do not co-reside. This is the "no overlap" arm
+        # against which co-location (default) is compared. See
+        # notes/ttft_latency_measurement_plan.md.
+        self.serialize_models = os.environ.get(
+            "VLLM_DUAL_MODEL_SERIALIZE", "0"
+        ).lower() in ("1", "true", "yes", "on")
 
         dual_cfg = DualModelConfig.from_vllm_config(vllm_config)
         if dual_cfg is None:
@@ -577,26 +586,48 @@ class DualModelRunner:
         # tasks run concurrently on the GPU when both have work.
         # execute_order only affects which task is submitted first --
         # CPU-side ordering, not GPU scheduling.
-        if self.execute_order == "embed_first":
-            embed_future = (
-                self._embed_executor.submit(run_embed) if has_embed_work else None
-            )
-            decode_future = (
-                self._decode_executor.submit(run_decode) if has_decode_work else None
-            )
-        else:
-            decode_future = (
-                self._decode_executor.submit(run_decode) if has_decode_work else None
-            )
-            embed_future = (
-                self._embed_executor.submit(run_embed) if has_embed_work else None
-            )
         decode_event: torch.cuda.Event | None = None
         embed_event: torch.cuda.Event | None = None
-        if decode_future is not None:
-            decode_output, decode_event = decode_future.result()
-        if embed_future is not None:
-            embed_exec_output, embed_event = embed_future.result()
+        if self.serialize_models:
+            # Sequential arm: run the two role forwards ONE AT A TIME, GPU-
+            # serialized. .result() only waits for the executor thread to finish
+            # enqueuing, so we synchronize the role's CUDA event before starting
+            # the other -- otherwise the first role's kernels would still be on
+            # the GPU when the second role's launch, defeating "no overlap".
+            order = (("embed", "decode") if self.execute_order == "embed_first"
+                     else ("decode", "embed"))
+            for role in order:
+                if role == "decode" and has_decode_work:
+                    decode_output, decode_event = (
+                        self._decode_executor.submit(run_decode).result()
+                    )
+                    if decode_event is not None:
+                        decode_event.synchronize()
+                elif role == "embed" and has_embed_work:
+                    embed_exec_output, embed_event = (
+                        self._embed_executor.submit(run_embed).result()
+                    )
+                    if embed_event is not None:
+                        embed_event.synchronize()
+        else:
+            if self.execute_order == "embed_first":
+                embed_future = (
+                    self._embed_executor.submit(run_embed) if has_embed_work else None
+                )
+                decode_future = (
+                    self._decode_executor.submit(run_decode) if has_decode_work else None
+                )
+            else:
+                decode_future = (
+                    self._decode_executor.submit(run_decode) if has_decode_work else None
+                )
+                embed_future = (
+                    self._embed_executor.submit(run_embed) if has_embed_work else None
+                )
+            if decode_future is not None:
+                decode_output, decode_event = decode_future.result()
+            if embed_future is not None:
+                embed_exec_output, embed_event = embed_future.result()
 
         # Cross-stream sync: have the main thread's current stream wait
         # for both role streams before any subsequent host or
