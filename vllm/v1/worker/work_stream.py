@@ -107,22 +107,36 @@ class WorkStream(ABC):
 
 
 class DefaultWorkStream(WorkStream):
-    """No partitioning.  ``stream`` is the device default stream and
-    ``context()`` is a true no-op.
+    """No SM partitioning -- full-GPU stream.
 
-    Used when ``VLLM_WORK_STREAM_BACKEND`` is unset or ``none``.  Callers
-    can rely on ``context()`` being free; the unpartitioned path doesn't
-    even take the stream-context-manager overhead.
+    Two forms:
+      * ``stream=None`` (default): wraps the device default stream and
+        ``context()`` is a true no-op (``contextlib.nullcontext``), so the
+        unpartitioned primary path pays zero overhead.
+      * ``stream=<torch.cuda.Stream>``: wraps a dedicated full-SM stream and
+        ``context()`` actually enters it.  Used for the embed side of a
+        ``backend=none`` dual-model deployment so decode (default stream) and
+        embed (this dedicated stream) run on two streams and OVERLAP -- the
+        old ``VLLM_DUAL_MODEL_STREAM_MODE=two_stream`` behaviour.  Both streams
+        still see all SMs; overlap comes from the hardware scheduler
+        co-residing the two streams' kernels (see project-theo-bottleneck-sync).
     """
 
     backend = BACKEND_NONE
 
-    def __init__(self, device: torch.device):
-        self.stream = torch.cuda.default_stream(device)
+    def __init__(self, device: torch.device, stream: torch.cuda.Stream | None = None):
+        if stream is None:
+            self.stream = torch.cuda.default_stream(device)
+            self._is_default = True
+        else:
+            self.stream = stream
+            self._is_default = False
         self.sm_count = None
 
     def context(self) -> AbstractContextManager:
-        return contextlib.nullcontext()
+        if self._is_default:
+            return contextlib.nullcontext()
+        return torch.cuda.stream(self.stream)
 
     def close(self) -> None:
         pass
@@ -473,11 +487,17 @@ def make_work_streams(
 
     if backend == BACKEND_NONE:
         primary = DefaultWorkStream(device)
-        aux = DefaultWorkStream(device) if is_dual else None
+        # Dual-model: give embed a DEDICATED full-SM stream so decode (default
+        # stream) and embed overlap on two streams -- the old two_stream
+        # default. Both see all SMs; the hardware scheduler co-resides them.
+        aux = (
+            DefaultWorkStream(device, torch.cuda.Stream(device))
+            if is_dual else None
+        )
         logger.info(
-            "WorkStream backend=none (dual_model=%s) -- using device default "
-            "stream(s); context() is a no-op.",
-            is_dual,
+            "WorkStream backend=none (dual_model=%s) -- decode on default "
+            "stream, embed on %s.",
+            is_dual, "a dedicated stream" if is_dual else "n/a",
         )
         return primary, aux
 

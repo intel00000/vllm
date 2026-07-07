@@ -12,4 +12,16 @@ class DualModelWorker(Worker):
 
     def init_device(self):
         super().init_device()
+        # super().init_device() built the worker's WorkStream(s) and wired them
+        # onto the runner IT constructed. We replace that runner with the
+        # dual-model runner here, so the WorkStreams must be re-wired onto it --
+        # otherwise DualModelRunner._decode_ctx() raises "set_work_streams() must
+        # be called before execute_model()".
         self.model_runner = DualModelRunner(self.vllm_config, self.device)
+        assert self._work_stream is not None
+        if self._aux_work_stream is not None:
+            self.model_runner.set_work_streams(
+                self._work_stream, self._aux_work_stream
+            )
+        else:
+            self.model_runner.bind_main_stream(self._work_stream.stream)
