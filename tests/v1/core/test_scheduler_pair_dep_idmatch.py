@@ -126,3 +126,48 @@ def test_finished_parent_treats_as_satisfied():
     child = _fake_request("decode-0-def67890",
                           parent_request_id=parent.request_id)
     assert sched._should_gate_child_on_parent(child) is False
+
+
+def test_finish_requests_gated_child_no_counter_underflow():
+    """Regression: aborting a request that is still in _gated_children must
+    NOT decrement _num_waiting_decode_reqs.
+
+    Gated children are held in _gated_children (outside self.waiting) and
+    were never counted via _mark_waiting_added_by_model. Before the fix,
+    finish_requests routed them through _mark_waiting_removed_by_model,
+    underflowing the counter (`assert _num_waiting_decode_reqs > 0` fired),
+    crashing engine-core shutdown at scale when gated children remained.
+    """
+    from collections import defaultdict
+
+    sched = _stub_scheduler(pair_dep=True)
+    sched._num_waiting_decode_reqs = 0  # gated child was never counted
+    sched._num_waiting_embed_reqs = 0
+    sched._num_running_decode_reqs = 0
+    sched._num_running_embed_reqs = 0
+    sched._gated_children = {}
+    sched._children_of_parent = defaultdict(set)
+    sched.num_waiting_for_streaming_input = 0
+    sched.finished_req_ids = set()
+    sched.finished_req_ids_dict = None
+
+    child = _fake_request("decode-0-def67890",
+                          parent_request_id="embed-0-abc12345")
+    child.model_id = "decode"       # -> _dual_model_request_kind == "decode"
+    child.client_index = 0
+    sched.requests = {child.request_id: child}
+    sched._gated_children[child.request_id] = child
+    sched._children_of_parent["embed-0-abc12345"].add(child.request_id)
+
+    # _free_request is heavy (block manager, connectors) -> stub it; we only
+    # assert the gate/counter bookkeeping.
+    with patch.object(Scheduler, "_free_request", lambda self, r, **k: None):
+        aborted = sched.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+
+    # No underflow, and the child is cleaned out of the gate structures.
+    assert sched._num_waiting_decode_reqs == 0
+    assert child.request_id not in sched._gated_children
+    assert child.request_id not in sched._children_of_parent.get(
+        "embed-0-abc12345", set()
+    )
+    assert (child.request_id, 0) in aborted
