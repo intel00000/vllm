@@ -203,17 +203,32 @@ class Scheduler(SchedulerInterface):
         # parent_request_id -> {child_request_id, ...}
         self._children_of_parent: dict[str, set[str]] = defaultdict(set)
 
-        # Per-step decision log. Tri-state HB_SCHEDULER_DECISION_LOG:
+        # Per-step decision log. HB_SCHEDULER_DECISION_LOG levels:
         #   0 / unset / false : disabled (no-op)
-        #   1 / true / on     : COMPACT -- emit per-reason counts only
-        #   2 / verbose       : VERBOSE -- emit full per-request lists
-        #                       (the original commit-6 format; can be
-        #                       several MB per cell on long runs)
-        # Records each request's admit/defer/skip/preempt reason so we
-        # can explain batching choices alongside per-model counts in
-        # SchedulerStats.
+        #   1 / true / on     : COMPACT -- per-verb counts + reason
+        #                       breakdown (admit/defer/skip/preempt with
+        #                       DEFER_* / STOP_* reasons). One line/step.
+        #   2 / verbose       : VERBOSE -- full per-request id lists per
+        #                       verb (the original commit-6 format; can be
+        #                       several MB per cell on long runs).
+        #   3 / kv            : COMPACT + per-step KV-CACHE BREAKDOWN by
+        #                       dual-model kind. Adds a second line/step:
+        #                       overall usage %, free blocks, and the
+        #                       block/token footprint held by decode vs
+        #                       embed requests (n, total, max-per-req).
+        #                       Answers "which requests -- long embeds vs
+        #                       decodes -- are eating the KV pool, and is
+        #                       KV exhaustion (STOP_KV_ALLOC_FAILED) why
+        #                       admission stops?". Also surfaces the same
+        #                       numbers in SchedulerStats -> the per-step
+        #                       scheduler trace JSON. Cost: an O(running)
+        #                       coordinator.get_blocks() walk per step, so
+        #                       gated to level 3 (off the hot path).
+        # See notes/scheduler_decision_log.md for the full field guide.
         _dl_raw = os.environ.get("HB_SCHEDULER_DECISION_LOG", "0").lower()
-        if _dl_raw in ("2", "verbose"):
+        if _dl_raw in ("3", "kv"):
+            self._decision_log_level = 3
+        elif _dl_raw in ("2", "verbose"):
             self._decision_log_level = 2
         elif _dl_raw in ("1", "true", "yes", "on"):
             self._decision_log_level = 1
@@ -223,6 +238,9 @@ class Scheduler(SchedulerInterface):
         self._decision_log_enabled = self._decision_log_level > 0
         self._decision_step: int = 0
         self._decisions: list[tuple[str, str, int]] = []
+        # Level-3 KV breakdown, computed once/step in _flush_decision_log and
+        # read by make_stats (same step, flush runs first). None otherwise.
+        self._last_kv_breakdown: dict[str, Any] | None = None
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -594,7 +612,10 @@ class Scheduler(SchedulerInterface):
                         break
 
             if new_blocks is None:
-                # Cannot schedule this request.
+                # Cannot schedule this request: KV pool exhausted and nothing
+                # left to preempt. This (not the seqs cap) is typically what
+                # caps concurrency -- surface it in the decision log.
+                self._log_decision(request.request_id, "STOP_KV_ALLOC_FAILED")
                 break
 
             # Schedule the request.
@@ -953,7 +974,11 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
+                    # The request cannot be scheduled: KV pool exhausted. This
+                    # break is what stops NEW admissions and caps concurrency
+                    # (the ~111 plateau) -- name it in the decision log rather
+                    # than stopping silently.
+                    self._log_decision(request_id, "STOP_KV_ALLOC_FAILED")
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -2207,11 +2232,78 @@ class Scheduler(SchedulerInterface):
         if self._decision_log_enabled:
             self._decisions.append((req_id, reason, num_tokens))
 
+    def _kv_breakdown(self) -> dict[str, Any]:
+        """Per-step KV footprint split by dual-model kind (level 3 only).
+
+        Walks self.running and sums each request's allocated KV blocks via
+        coordinator.get_blocks(). Returns block_size, overall usage, free
+        blocks, and per-kind [n, total_blocks, max_blocks_per_req] for
+        decode and embed. Cheap (a dict lookup + len per running request)
+        but gated to level 3 so it never touches the hot path.
+        """
+        coord = self.kv_cache_manager.coordinator
+        try:
+            block_size = coord.single_type_managers[0].block_size
+        except (IndexError, AttributeError):
+            block_size = 0
+        agg = {"decode": [0, 0, 0], "embed": [0, 0, 0]}  # [n, blocks, max]
+        for req in self.running:
+            kind = self._dual_model_request_kind(req)
+            if kind not in ("decode", "embed"):
+                continue
+            nb = sum(len(g) for g in coord.get_blocks(req.request_id))
+            a = agg[kind]
+            a[0] += 1
+            a[1] += nb
+            a[2] = max(a[2], nb)
+        pool = self.kv_cache_manager.block_pool
+        try:
+            free = pool.get_num_free_blocks()
+            total = pool.num_gpu_blocks - 1  # -1 for the null block (matches usage)
+        except AttributeError:
+            free, total = 0, 0
+        # used = blocks NOT in the free queue. Finished/aborted/preempted reqs
+        # have already freed their blocks (req_to_blocks popped + returned to
+        # the free queue), so `used` reflects only live blocks. `owned` sums
+        # blocks held by RUNNING dual-model reqs. owned vs used reconciles:
+        # if they match, no stale/leaked blocks are being counted; a positive
+        # (used - owned) gap is blocks held by non-dual-model reqs or overhead.
+        used = max(0, total - free)
+        owned = agg["decode"][1] + agg["embed"][1]
+        return {
+            "block_size": block_size,
+            "usage": self.kv_cache_manager.usage,
+            "free_blocks": free,
+            "total_blocks": total,
+            "used_blocks": used,
+            "owned_blocks": owned,
+            "decode": agg["decode"],
+            "embed": agg["embed"],
+        }
+
     def _flush_decision_log(
         self, *, budget_remaining: int, budget_total: int
     ) -> None:
         if self._decision_log_level == 0:
             return
+
+        # Level 3: compute the KV breakdown once/step, cache it for
+        # make_stats (runs after this), and emit the KV line.
+        self._last_kv_breakdown = None
+        if self._decision_log_level >= 3 and self.dual_model_config is not None:
+            kv = self._kv_breakdown()
+            self._last_kv_breakdown = kv
+            d, e, bs = kv["decode"], kv["embed"], kv["block_size"]
+            logger.info(
+                "[sched step=%d kv=%.1f%% used=%d owned=%d free=%d/%d bs=%d] "
+                "decode n=%d blocks=%d (max %d ~%dtok)  "
+                "embed n=%d blocks=%d (max %d ~%dtok)",
+                self._decision_step, 100 * kv["usage"],
+                kv["used_blocks"], kv["owned_blocks"],
+                kv["free_blocks"], kv["total_blocks"], bs,
+                d[0], d[1], d[2], d[2] * bs,
+                e[0], e[1], e[2], e[2] * bs,
+            )
 
         # Bucket entries by verb (ADMIT/DEFER/SKIP/PREEMPTED) AND by full
         # reason for compact-mode reason-counts.
@@ -2694,6 +2786,10 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        # Dual-model running counts are always cheap (in-process counters);
+        # the KV block split comes from the level-3 breakdown cached by
+        # _flush_decision_log this same step (None below level 3 -> zeros).
+        _kv = self._last_kv_breakdown
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -2706,6 +2802,14 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            num_running_decode_reqs=self._num_running_decode_reqs,
+            num_running_embed_reqs=self._num_running_embed_reqs,
+            num_waiting_decode_reqs=self._num_waiting_decode_reqs,
+            num_waiting_embed_reqs=self._num_waiting_embed_reqs,
+            kv_blocks_decode=(_kv["decode"][1] if _kv else 0),
+            kv_blocks_embed=(_kv["embed"][1] if _kv else 0),
+            kv_blocks_free=(_kv["free_blocks"] if _kv else 0),
+            kv_blocks_used=(_kv["used_blocks"] if _kv else 0),
         )
 
     def make_spec_decoding_stats(
