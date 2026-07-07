@@ -2963,6 +2963,21 @@ class Scheduler(SchedulerInterface):
                 continue
 
             valid_requests.append(request)
+            # RAG pair-dep gated children live in _gated_children -- they are
+            # NOT in self.waiting/running and were never counted in the
+            # waiting-by-model counter (_enqueue_waiting_request counts;
+            # gating skips it). Letting them fall through to the waiting path
+            # calls _mark_waiting_removed_by_model, which underflows
+            # _num_waiting_decode_reqs (asserts, crashes shutdown at scale).
+            # Clean them out of the gate structures and free them directly.
+            # Composes with parent cascade: whoever runs first pops the child
+            # from _gated_children; the other sees it already gone.
+            if request.request_id in self._gated_children:
+                self._gated_children.pop(request.request_id, None)
+                parent_id = getattr(request, "parent_request_id", None)
+                if parent_id is not None and parent_id in self._children_of_parent:
+                    self._children_of_parent[parent_id].discard(request.request_id)
+                continue
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
             else:
