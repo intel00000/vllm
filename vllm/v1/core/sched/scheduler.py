@@ -699,6 +699,11 @@ class Scheduler(SchedulerInterface):
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    # Concurrency capped by max_num_seqs (NOT KV space). Log it
+                    # so the decision trace distinguishes "hit the seqs cap"
+                    # from STOP_KV_ALLOC_FAILED (KV pool exhausted) -- the two
+                    # different reasons the running set stops growing.
+                    self._log_decision("_", "STOP_SEQS_CAP")
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -2338,7 +2343,7 @@ class Scheduler(SchedulerInterface):
             # per-request lists would flood ~running ids per step).
             logger.info(
                 "[sched step=%d budget=%d/%d running=%d waiting=%d%s] "
-                "admit=%s defer=%s skip=%s preempt=%s",
+                "admit=%s defer=%s skip=%s preempt=%s stop=%s",
                 self._decision_step,
                 budget_total - budget_remaining,
                 budget_total,
@@ -2349,6 +2354,7 @@ class Scheduler(SchedulerInterface):
                 verb_to_entries.get("DEFER") or "[]",
                 verb_to_entries.get("SKIP") or "[]",
                 verb_to_entries.get("PREEMPTED") or "[]",
+                verb_to_entries.get("STOP") or "[]",
             )
             return
 
@@ -2369,7 +2375,7 @@ class Scheduler(SchedulerInterface):
 
         logger.info(
             "[sched step=%d budget=%d/%d running=%d waiting=%d%s] "
-            "admit=%s defer=%s skip=%s preempt=%s",
+            "admit=%s defer=%s skip=%s preempt=%s stop=%s",
             self._decision_step,
             budget_total - budget_remaining,
             budget_total,
@@ -2380,6 +2386,7 @@ class Scheduler(SchedulerInterface):
             _verb_summary("DEFER"),
             _verb_summary("SKIP"),
             _verb_summary("PREEMPTED"),
+            _verb_summary("STOP"),
         )
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
