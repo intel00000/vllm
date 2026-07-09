@@ -86,6 +86,12 @@ class WorkStream(ABC):
     stream: torch.cuda.Stream
     backend: str  # one of BACKEND_*
     sm_count: int | None = None  # how many SMs this stream is restricted to
+    # Full-SM stream to fall back to on SOLO steps (only this role has work),
+    # so a role that isn't overlapping the other doesn't needlessly run on its
+    # reduced SM partition.  Set by make_work_streams for partitioning backends;
+    # None for DefaultWorkStream (already full-SM).  The runner uses the
+    # partitioned stream only when BOTH roles have work in a step.
+    full_fallback: "WorkStream | None" = None
 
     @abstractmethod
     def context(self) -> AbstractContextManager:
@@ -520,9 +526,16 @@ def make_work_streams(
             decode_ws, embed_ws = LibsmctrlWorkStream.create_pair(
                 device, decode_sms, embed_sms, total_sms
             )
+        # Solo-step fallback: a role that runs alone (the other has no work
+        # this step -- 90%+ of steps in the saturated regime) should use FULL
+        # SMs, not its reduced partition.  Give each role a full-SM stream to
+        # fall back to; decode reuses the default stream, embed a dedicated one
+        # (so if both fall back in the same step they still don't collide).
+        decode_ws.full_fallback = DefaultWorkStream(device)
+        embed_ws.full_fallback = DefaultWorkStream(device, torch.cuda.Stream(device))
         logger.info(
             "WorkStream backend=%s dual: decode=%d SMs (req %d) "
-            "embed=%d SMs (req %d) total=%d",
+            "embed=%d SMs (req %d) total=%d  (+full-SM solo fallback)",
             backend, decode_ws.sm_count, decode_sms,
             embed_ws.sm_count, embed_sms, total_sms,
         )

@@ -117,6 +117,16 @@ class DualModelRunner:
         # must call ``set_work_streams`` themselves before executing.
         self._decode_ws: WorkStream | None = None
         self._embed_ws: WorkStream | None = None
+        # The WorkStream actually used THIS step per role: the partitioned ws
+        # when both roles have work, else the role's full-SM fallback. Set at
+        # the top of execute_model; _decode_ctx/_embed_ctx follow it.
+        self._decode_ws_active: WorkStream | None = None
+        self._embed_ws_active: WorkStream | None = None
+        # A/B toggle: VLLM_DUAL_SOLO_FALLBACK=0 disables the solo-step full-SM
+        # fallback (partitioned stream on every step = old regressed behavior),
+        # so we can isolate the fix's effect. Default on.
+        self._solo_full_fallback = (
+            os.environ.get("VLLM_DUAL_SOLO_FALLBACK", "1") != "0")
         self.decode_stream: torch.cuda.Stream | None = None
         self.embed_stream: torch.cuda.Stream | None = None
 
@@ -230,14 +240,66 @@ class DualModelRunner:
         """
         self._decode_ws = decode_ws
         self._embed_ws = embed_ws
+        # Active ws defaults to the (partitioned) ws; execute_model swaps to the
+        # full-SM fallback on solo steps.
+        self._decode_ws_active = decode_ws
+        self._embed_ws_active = embed_ws
         self.decode_stream = decode_ws.stream
         self.embed_stream = embed_ws.stream
         self.decode_runner.bind_main_stream(decode_ws.stream)
         self.embed_runner.bind_main_stream(embed_ws.stream)
         # Warm cuBLAS / per-thread state on each executor thread under
-        # the role's WorkStream context.
+        # the role's WorkStream context -- both the partitioned ws AND its
+        # full-SM fallback, since a role thread runs on either across steps.
         self._warm_role_thread(self._decode_executor, decode_ws, self.device)
         self._warm_role_thread(self._embed_executor, embed_ws, self.device)
+        if decode_ws.full_fallback is not None:
+            self._warm_role_thread(
+                self._decode_executor, decode_ws.full_fallback, self.device)
+        if embed_ws.full_fallback is not None:
+            self._warm_role_thread(
+                self._embed_executor, embed_ws.full_fallback, self.device)
+
+    def _select_active_ws(self, has_decode_work: bool, has_embed_work: bool) -> None:
+        """Pick each role's WorkStream for this step: the partitioned ws only
+        when BOTH roles have work (so their kernels run on disjoint SM groups);
+        otherwise the lone role runs on its full-SM fallback. No-op for
+        backend=none (full_fallback is None -> stays on the full-SM ws).
+
+        On a stream SWITCH this is where the original vllm raced
+        (cudaErrorIllegalAddress). Two barriers make the swap safe:
+          1. ``new.stream.wait_stream(old.stream)`` -- the new stream waits for
+             all work already queued on the old stream (this role's KV-cache
+             writes from prior steps) before its forward reads/writes KV, so a
+             read can't run ahead of the previous write on the other stream.
+          2. ``runner.bind_main_stream(new.stream)`` -- rebind the runner's
+             cached ``main_stream`` so async-output D2H gates on the stream the
+             forward actually ran on (a stale main_stream is exactly the
+             illegal-address failure documented in bind_main_stream). Cheap
+             (a dict assignment)."""
+        both = bool(has_decode_work) and bool(has_embed_work)
+        if not self._solo_full_fallback:
+            both = True  # A/B off: force partitioned every step (old behavior)
+        d, e = self._decode_ws, self._embed_ws
+        new_d = (d if (both or d is None or d.full_fallback is None)
+                 else d.full_fallback)
+        new_e = (e if (both or e is None or e.full_fallback is None)
+                 else e.full_fallback)
+        prev_d, prev_e = self._decode_ws_active, self._embed_ws_active
+        if (new_d is not None and prev_d is not None
+                and new_d.stream is not prev_d.stream):
+            new_d.stream.wait_stream(prev_d.stream)
+            self.decode_runner.bind_main_stream(new_d.stream)
+        if (new_e is not None and prev_e is not None
+                and new_e.stream is not prev_e.stream):
+            new_e.stream.wait_stream(prev_e.stream)
+            self.embed_runner.bind_main_stream(new_e.stream)
+        self._decode_ws_active = new_d
+        self._embed_ws_active = new_e
+        if new_d is not None:
+            self.decode_stream = new_d.stream
+        if new_e is not None:
+            self.embed_stream = new_e.stream
 
     def _decode_ctx(self):
         """Context manager for decode-role CUDA work, routed through the
@@ -250,7 +312,7 @@ class DualModelRunner:
                 "constructing DualModelRunner directly, build "
                 "WorkStreams via make_work_streams() and pass them in."
             )
-        return self._decode_ws.context()
+        return (self._decode_ws_active or self._decode_ws).context()
 
     def _embed_ctx(self):
         if self._embed_ws is None:
@@ -258,7 +320,7 @@ class DualModelRunner:
                 "DualModelRunner: set_work_streams() must be called "
                 "before execute_model() / sample_tokens()."
             )
-        return self._embed_ws.context()
+        return (self._embed_ws_active or self._embed_ws).context()
 
     def __del__(self):
         # Best-effort: shut down the per-role executors. Non-blocking
@@ -577,6 +639,12 @@ class DualModelRunner:
             split_outputs.embed.num_scheduled_tokens
             or split_outputs.embed.finished_req_ids
         )
+
+        # Choose each role's active stream (partitioned only when BOTH have
+        # work; else full-SM fallback) BEFORE dispatch. run_decode/run_embed and
+        # the embed pool below all route through _decode_ctx/_embed_ctx and
+        # self.{decode,embed}_stream, which now follow the active selection.
+        self._select_active_ws(bool(has_decode_work), bool(has_embed_work))
 
         decode_output = None
         embed_exec_output = None
