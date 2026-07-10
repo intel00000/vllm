@@ -325,6 +325,21 @@ class EngineCore:
             vllm_config, kv_cache_specs, available_gpu_memory
         )
 
+        # Dual-model KV overlay: a merged decode+embed spec sizes every block to
+        # hold BOTH models' layers, but each request uses one model -> half of
+        # every block is dead. Pair decode-layer-i with embed-layer-i onto shared
+        # buffers and double num_blocks (no-op for single-model runs). Must run
+        # before the scheduler config is derived below so both scheduler and
+        # workers see the corrected block count.
+        from vllm.v1.worker.dual_model_helpers import (
+            overlay_dual_model_kv_cache_config,
+        )
+
+        kv_cache_configs = [
+            overlay_dual_model_kv_cache_config(vllm_config, cfg)
+            for cfg in kv_cache_configs
+        ]
+
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling
         # and have the original (larger) max_model_len cached.

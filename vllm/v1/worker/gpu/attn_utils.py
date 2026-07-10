@@ -170,12 +170,31 @@ def init_attn_backend(
 
 
 def _allocate_kv_cache(
-    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
+    kv_cache_config: KVCacheConfig,
+    shared_layers: dict[str, str],
+    device: torch.device,
+    external_raw_tensors: dict[str, torch.Tensor] | None = None,
 ):
+    # `external_raw_tensors` lets a second runner reuse an already-allocated
+    # buffer for a layer instead of allocating fresh memory. The dual-model
+    # runner uses this so the embed model's per-layer KV overlays the decode
+    # model's (a given physical block is only ever owned by one model at a
+    # time), removing the per-block decode+embed double-count.
+    external = external_raw_tensors or {}
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     packed_backing: torch.Tensor | None = None
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        if kv_cache_tensor.block_stride > 0:
+        reuse = next(
+            (external[ln] for ln in kv_cache_tensor.shared_by if ln in external),
+            None,
+        )
+        if reuse is not None:
+            assert reuse.numel() == kv_cache_tensor.size, (
+                f"reused KV buffer size {reuse.numel()} != expected "
+                f"{kv_cache_tensor.size} for layers {kv_cache_tensor.shared_by}"
+            )
+            tensor = reuse
+        elif kv_cache_tensor.block_stride > 0:
             # Allocate once; all packed tensors alias the same backing.
             if packed_backing is None:
                 packed_backing = torch.zeros(
@@ -526,10 +545,11 @@ def init_kv_cache(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
-) -> dict[str, Any]:
+    external_raw_tensors: dict[str, torch.Tensor] | None = None,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     kv_cache_raw_tensors = _allocate_kv_cache(
-        kv_cache_config, shared_kv_cache_layers, device
+        kv_cache_config, shared_kv_cache_layers, device, external_raw_tensors
     )
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
     kv_caches = _reshape_kv_cache(
@@ -549,7 +569,7 @@ def init_kv_cache(
         else 1
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
-    return kv_caches
+    return kv_caches, kv_cache_raw_tensors
 
 
 def build_slot_mappings_by_layer(

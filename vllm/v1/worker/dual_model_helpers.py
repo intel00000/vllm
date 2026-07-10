@@ -3,20 +3,97 @@
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
+
+logger = init_logger(__name__)
 
 DUAL_MODEL_CONFIG_KEY = "dual_model"
 DEFAULT_DECODE_MODEL_ID = "decode"
 DEFAULT_EMBED_MODEL_ID = "embed"
+
+# Substring that marks an embed-model KV layer name (see
+# DualModelRunner.EMBED_MODEL_PREFIX). Decode-model layers never contain it.
+EMBED_LAYER_MARKER = "embed_model"
+
+
+def _kv_layer_index(layer_name: str) -> int:
+    m = re.search(r"layers\.(\d+)", layer_name)
+    return int(m.group(1)) if m else 0
+
+
+def overlay_dual_model_kv_cache_config(
+    vllm_config: Any, kv_cache_config: KVCacheConfig
+) -> KVCacheConfig:
+    """Overlay embed-model KV layers onto decode-model KV layers.
+
+    The base config is built from a single merged spec that lists BOTH models'
+    layers (decode + embed), so it sizes every physical block to hold both --
+    but a request only ever uses one model, leaving half of every block dead
+    (the 288 vs 144 KiB/token "double-count"). This pairs decode-layer-i with
+    embed-layer-i onto one shared KVCacheTensor and doubles ``num_blocks``. The
+    scheduler's single block pool then hands out ~2x the blocks; the worker
+    overlays the two models' layer-i onto the same buffer, which is safe
+    because the block pool gives any physical block to exactly one request (one
+    model) at a time.
+
+    No-op (returns the input unchanged) when this is not a dual-model run, when
+    the layers do not pair cleanly (unequal counts or differing per-layer page
+    sizes), or when ``VLLM_DUAL_KV_OVERLAY=0``.
+    """
+    if os.environ.get("VLLM_DUAL_KV_OVERLAY", "1") == "0":
+        return kv_cache_config
+    if DualModelConfig.from_vllm_config(vllm_config) is None:
+        return kv_cache_config
+
+    decode_ts: list[KVCacheTensor] = []
+    embed_ts: list[KVCacheTensor] = []
+    for t in kv_cache_config.kv_cache_tensors:
+        names = list(t.shared_by)
+        if len(names) != 1:
+            # Already paired / unexpected layout -> leave untouched.
+            return kv_cache_config
+        (embed_ts if EMBED_LAYER_MARKER in names[0] else decode_ts).append(t)
+
+    if not decode_ts or len(decode_ts) != len(embed_ts):
+        return kv_cache_config
+    sizes = {t.size for t in decode_ts} | {t.size for t in embed_ts}
+    if len(sizes) != 1:
+        # decode/embed per-layer page sizes differ -> can't overlay safely.
+        return kv_cache_config
+    old_size = sizes.pop()
+
+    decode_ts.sort(key=lambda t: _kv_layer_index(t.shared_by[0]))
+    embed_ts.sort(key=lambda t: _kv_layer_index(t.shared_by[0]))
+    paired = [
+        KVCacheTensor(size=old_size * 2, shared_by=[d.shared_by[0], e.shared_by[0]])
+        for d, e in zip(decode_ts, embed_ts)
+    ]
+    new_num_blocks = kv_cache_config.num_blocks * 2
+    logger.info(
+        "Dual-model KV overlay: paired %d decode+embed layer buffers, "
+        "num_blocks %d -> %d (removes per-block decode+embed double-count)",
+        len(paired),
+        kv_cache_config.num_blocks,
+        new_num_blocks,
+    )
+    return KVCacheConfig(
+        num_blocks=new_num_blocks,
+        kv_cache_tensors=paired,
+        kv_cache_groups=kv_cache_config.kv_cache_groups,
+    )
 
 
 @dataclass(frozen=True)
