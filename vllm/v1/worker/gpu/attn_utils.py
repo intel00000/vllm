@@ -126,10 +126,33 @@ def init_attn_backend(
     )
 
 
-def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
+def _allocate_kv_cache(
+    kv_cache_config: KVCacheConfig,
+    device: torch.device,
+    external_raw_tensors: dict[str, torch.Tensor] | None = None,
+):
+    # `external_raw_tensors` lets a second runner reuse an already-allocated
+    # buffer for a layer instead of allocating fresh memory. The dual-model
+    # runner uses this so the embed model's per-layer KV overlays the decode
+    # model's (a given physical block is only ever owned by one model at a
+    # time), removing the per-block decode+embed double-count.
+    external = external_raw_tensors or {}
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+        reuse = next(
+            (external[ln] for ln in kv_cache_tensor.shared_by if ln in external),
+            None,
+        )
+        if reuse is not None:
+            assert reuse.numel() == kv_cache_tensor.size, (
+                f"reused KV buffer size {reuse.numel()} != expected "
+                f"{kv_cache_tensor.size} for layers {kv_cache_tensor.shared_by}"
+            )
+            tensor = reuse
+        else:
+            tensor = torch.zeros(
+                kv_cache_tensor.size, dtype=torch.int8, device=device
+            )
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 
@@ -275,13 +298,16 @@ def init_kv_cache(
     attn_backends: dict[str, type[AttentionBackend]],
     device: torch.device,
     cache_dtype: str,
-) -> dict[str, Any]:
-    kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
+    external_raw_tensors: dict[str, torch.Tensor] | None = None,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    kv_cache_raw_tensors = _allocate_kv_cache(
+        kv_cache_config, device, external_raw_tensors
+    )
     kv_caches = _reshape_kv_cache(
         kv_cache_config, kv_cache_raw_tensors, attn_backends, cache_dtype
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
-    return kv_caches
+    return kv_caches, kv_cache_raw_tensors
 
 
 def build_slot_mappings_by_layer(

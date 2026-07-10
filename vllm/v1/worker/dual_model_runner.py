@@ -522,6 +522,23 @@ class DualModelRunner:
             **self.embed_kv_cache_spec,
         }
 
+    @classmethod
+    def _paired_layer_map(cls, kv_cache_config: KVCacheConfig) -> dict[str, str]:
+        """From an overlaid config (tensors ``shared_by=[decode_layer,
+        embed_layer]``) return ``{embed_layer: decode_layer}``. Empty when the
+        KV overlay did not run (each tensor is shared by a single layer)."""
+        mapping: dict[str, str] = {}
+        for t in kv_cache_config.kv_cache_tensors:
+            decode_layers = [
+                ln for ln in t.shared_by if cls.EMBED_MODEL_PREFIX not in ln
+            ]
+            embed_layers = [
+                ln for ln in t.shared_by if cls.EMBED_MODEL_PREFIX in ln
+            ]
+            if len(decode_layers) == 1 and len(embed_layers) == 1:
+                mapping[embed_layers[0]] = decode_layers[0]
+        return mapping
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         decode_kv_cache_config, self.decode_kv_group_indices = (
             self._project_kv_cache_config(kv_cache_config, self.decode_kv_cache_spec)
@@ -529,8 +546,34 @@ class DualModelRunner:
         embed_kv_cache_config, self.embed_kv_group_indices = (
             self._project_kv_cache_config(kv_cache_config, self.embed_kv_cache_spec)
         )
+        # When the KV overlay paired decode-layer-i with embed-layer-i onto
+        # shared tensors, the projected decode/embed configs each claim the FULL
+        # (doubled) num_blocks -- allocating both independently would need 2x the
+        # memory. Instead allocate the decode buffers, then overlay the embed
+        # model's layers onto the same physical buffers. Safe: the shared block
+        # pool gives any physical block to exactly one model at a time.
+        embed_to_decode_layer = self._paired_layer_map(kv_cache_config)
         self.decode_runner.initialize_kv_cache(decode_kv_cache_config)
-        self.embed_runner.initialize_kv_cache(embed_kv_cache_config)
+        external_raw = None
+        if embed_to_decode_layer:
+            decode_raw = self.decode_runner.kv_cache_raw_tensors
+            external_raw = {
+                embed_layer: decode_raw[decode_layer]
+                for embed_layer, decode_layer in embed_to_decode_layer.items()
+                if decode_layer in decode_raw
+            }
+            if len(external_raw) != len(embed_to_decode_layer):
+                # Incomplete pairing -> fall back to independent allocation.
+                logger.warning(
+                    "Dual-model KV overlay: only %d/%d embed layers mapped to "
+                    "decode buffers; falling back to independent allocation.",
+                    len(external_raw),
+                    len(embed_to_decode_layer),
+                )
+                external_raw = None
+        self.embed_runner.initialize_kv_cache(
+            embed_kv_cache_config, external_raw_tensors=external_raw
+        )
 
     def profile_run(self) -> None:
         self.decode_runner.profile_run()

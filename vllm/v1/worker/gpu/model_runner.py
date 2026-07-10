@@ -360,7 +360,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        external_raw_tensors: dict[str, torch.Tensor] | None = None,
+    ) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
@@ -440,14 +444,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
-        kv_caches_dict = init_kv_cache(
+        kv_caches_dict, kv_cache_raw_tensors = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
             self.attn_backends,
             self.device,
             self.cache_config.cache_dtype,
+            external_raw_tensors,
         )
+        # Expose the per-layer raw byte buffers so a co-hosted runner (dual
+        # model) can overlay its own layers onto the same memory.
+        self.kv_cache_raw_tensors = kv_cache_raw_tensors
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     @torch.inference_mode()
