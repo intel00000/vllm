@@ -149,6 +149,18 @@ class DualModelRunner:
         self.serialize_models = os.environ.get(
             "VLLM_DUAL_MODEL_SERIALIZE", "0"
         ).lower() in ("1", "true", "yes", "on")
+        # How the sequential arm enforces "no overlap":
+        #   "stream" (default, steelman): serialize the two role-forwards with a
+        #     GPU-side stream dependency (wait_event). The CPU enqueues both
+        #     back-to-back; the GPU runs decode-then-embed with no bubble and no
+        #     overlap -- the maximum a single-GPU serial scheduler can do, so the
+        #     baseline is not handicapped.
+        #   "event" (legacy): CPU-side event.synchronize() between roles, which
+        #     stalls the host and leaves a GPU bubble. Kept for the control that
+        #     measures how much of the co-location win was that artifact.
+        self._serialize_mode = os.environ.get(
+            "VLLM_DUAL_SERIALIZE_MODE", "stream"
+        ).lower()
 
         dual_cfg = DualModelConfig.from_vllm_config(vllm_config)
         if dual_cfg is None:
@@ -700,26 +712,37 @@ class DualModelRunner:
         decode_event: torch.cuda.Event | None = None
         embed_event: torch.cuda.Event | None = None
         if self.serialize_models:
-            # Sequential arm: run the two role forwards ONE AT A TIME, GPU-
-            # serialized. .result() only waits for the executor thread to finish
-            # enqueuing, so we synchronize the role's CUDA event before starting
-            # the other -- otherwise the first role's kernels would still be on
-            # the GPU when the second role's launch, defeating "no overlap".
+            # Sequential arm: run the two role forwards ONE AT A TIME with NO
+            # GPU overlap. Two ways to enforce that (see _serialize_mode):
+            #   stream (steelman): the second role's stream waits on the first
+            #     role's completion event (a GPU-side dependency). The host
+            #     enqueues both back-to-back, so the GPU runs decode-then-embed
+            #     with no bubble -- the best a serial scheduler can do.
+            #   event (legacy): event.synchronize() stalls the host between
+            #     roles (bubble). Kept as a control.
             order = (("embed", "decode") if self.execute_order == "embed_first"
                      else ("decode", "embed"))
+            prev_event: torch.cuda.Event | None = None
             for role in order:
                 if role == "decode" and has_decode_work:
+                    if prev_event is not None:
+                        # GPU-side serialize: decode waits for the prior role.
+                        self.decode_stream.wait_event(prev_event)
                     decode_output, decode_event = (
                         self._decode_executor.submit(run_decode).result()
                     )
-                    if decode_event is not None:
+                    if self._serialize_mode == "event" and decode_event is not None:
                         decode_event.synchronize()
+                    prev_event = decode_event
                 elif role == "embed" and has_embed_work:
+                    if prev_event is not None:
+                        self.embed_stream.wait_event(prev_event)
                     embed_exec_output, embed_event = (
                         self._embed_executor.submit(run_embed).result()
                     )
-                    if embed_event is not None:
+                    if self._serialize_mode == "event" and embed_event is not None:
                         embed_event.synchronize()
+                    prev_event = embed_event
         else:
             if self.execute_order == "embed_first":
                 embed_future = (
