@@ -82,12 +82,20 @@ def overlay_dual_model_kv_cache_config(
         for d, e in zip(decode_ts, embed_ts)
     ]
     new_num_blocks = kv_cache_config.num_blocks * 2
+    block_size = (
+        kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        if kv_cache_config.kv_cache_groups
+        else 16
+    )
     logger.info(
         "Dual-model KV overlay: paired %d decode+embed layer buffers, "
-        "num_blocks %d -> %d (removes per-block decode+embed double-count)",
+        "num_blocks %d -> %d (removes per-block decode+embed double-count). "
+        "True GPU KV cache size: %s tokens -- the 'GPU KV cache size' line "
+        "logged above is pre-overlay and 2x low for dual-model runs.",
         len(paired),
         kv_cache_config.num_blocks,
         new_num_blocks,
+        f"{new_num_blocks * block_size:,}",
     )
     return KVCacheConfig(
         num_blocks=new_num_blocks,
