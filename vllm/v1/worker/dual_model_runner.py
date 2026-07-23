@@ -434,6 +434,14 @@ class DualModelRunner:
         embed_vllm_config.additional_config = {}
         embed_vllm_config.compilation_config.static_forward_context.clear()
         embed_vllm_config.compilation_config.static_all_moe_layers.clear()
+        # Embed is prefill-only (pooling) with variable-length inputs, so CUDA
+        # graphs (static shapes only) never apply. Force NONE so the embed runner
+        # never captures -- otherwise, when decode graphs are enabled, the two
+        # runners race to record into the single shared graph mempool on their
+        # separate executor threads and die with
+        # "beginAllocateToPool: already recording to mempool_id".
+        from vllm.config import CUDAGraphMode
+        embed_vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         return embed_vllm_config
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -614,13 +622,15 @@ class DualModelRunner:
         # so the capturing and replaying threads -- and their cuBLAS state --
         # match. Mismatched threads here would resurface as
         # CUBLAS_STATUS_EXECUTION_FAILED at first replay.
-        decode_future = self._decode_executor.submit(
-            self.decode_runner.capture_model
-        )
-        embed_future = self._embed_executor.submit(
-            self.embed_runner.capture_model
-        )
-        return decode_future.result() + embed_future.result()
+        # Serialize the two captures: CUDA allows only one active capture per
+        # graph mempool, and both runners share one pool. Run decode's capture to
+        # completion on its executor thread, THEN embed's (a no-op now that embed
+        # is forced eager, but kept ordered as a safety belt). Each still runs on
+        # its role's thread so the per-thread cuBLAS handle recorded into the
+        # graph matches the replay thread (see note above).
+        n = self._decode_executor.submit(self.decode_runner.capture_model).result()
+        n += self._embed_executor.submit(self.embed_runner.capture_model).result()
+        return n
 
     def _dummy_run(self, *args, **kwargs):
         return self.decode_runner._dummy_run(*args, **kwargs)
