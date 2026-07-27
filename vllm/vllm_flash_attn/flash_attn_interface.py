@@ -6,6 +6,10 @@
 
 import torch
 
+# sm-lever-sweep experiment: FA3 SM-margin env gate (see _effective_sm_margin)
+import os
+import threading
+
 # isort: off
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
@@ -118,6 +122,30 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _effective_sm_margin(explicit: int = 0) -> int:
+    """sm-lever-sweep experiment hook: cap FA3 SMs for the EMBED role only.
+
+    Returns ``explicit`` when >0; otherwise reads ``VLLM_FA_SM_MARGIN`` but only
+    honors it on the dedicated embed executor thread (name prefix ``dual_embed``),
+    so decode's (cudagraph-captured) attention always stays at sm_margin=0.
+    Default (env unset) returns 0 -> byte-identical to stock behavior. Both the
+    forward and get_scheduler_metadata derive their margin here, so the AOT
+    schedule and the launch always agree on num_sm.
+    """
+    if explicit and explicit > 0:
+        return explicit
+    raw = os.environ.get("VLLM_FA_SM_MARGIN")
+    if not raw:
+        return 0
+    try:
+        m = int(raw)
+    except ValueError:
+        return 0
+    if m <= 0:
+        return 0
+    return m if threading.current_thread().name.startswith("dual_embed") else 0
+
+
 # NOTE only used in FA3
 def get_scheduler_metadata(
     batch_size,
@@ -142,6 +170,7 @@ def get_scheduler_metadata(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
+    sm_margin = _effective_sm_margin(sm_margin)
     if headdim_v is None:
         headdim_v = headdim
     scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
@@ -200,6 +229,7 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     num_splits: int = 0,
+    sm_margin: int = 0,  # sm-lever-sweep: cap SMs for embed attention (env-gated)
     # FA4 Only
     output_scale=None,
     # Version selector
@@ -290,6 +320,7 @@ def flash_attn_varlen_func(
         assert len(window_size) == 2
         real_window_size = (window_size[0], window_size[1])
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    sm_margin = _effective_sm_margin(sm_margin)
 
     dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
 
@@ -377,7 +408,7 @@ def flash_attn_varlen_func(
             scheduler_metadata,
             num_splits,
             None,  # pack_gqa
-            0,  # sm_margin
+            sm_margin,  # sm_margin (sm-lever-sweep: env-gated for embed)
             s_aux,  # s_aux
             cp_world_size,
             cp_rank,
