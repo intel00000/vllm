@@ -224,6 +224,7 @@ class LLMEngine:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         prompt_text: str | None = None,
+        parent_request_id: str | None = None,
     ) -> str:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -257,6 +258,9 @@ class LLMEngine:
                 priority=priority,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+
+        if parent_request_id is not None:
+            request.parent_request_id = parent_request_id
 
         self.input_processor.assign_request_id(request)
 

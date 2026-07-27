@@ -75,6 +75,7 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        parent_request_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -82,6 +83,7 @@ class Request:
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.model_id = infer_model_id(sampling_params, pooling_params, model_id)
+        self.parent_request_id = parent_request_id
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
@@ -202,6 +204,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            parent_request_id=request.parent_request_id,
         )
 
     def append_output_token_ids(

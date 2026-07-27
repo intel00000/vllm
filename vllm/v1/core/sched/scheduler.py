@@ -182,6 +182,17 @@ class Scheduler(SchedulerInterface):
         self._embed_wait_drained_phase_started = False
         self._embed_wait_drained_phase_released = False
 
+        # RAG-style pair dependency. A child request (typically a decode whose
+        # generation depends on the result of an embed) can be added with
+        # parent_request_id pointing at its parent. While the parent is still
+        # in flight, the child is held in _gated_children and NOT enqueued to
+        # self.waiting / self.skipped_waiting (putting them there would block
+        # younger embed-only requests via the FCFS-priority head). Released
+        # in _free_request when the parent finishes.
+        self._gated_children: dict[str, Request] = {}
+        # parent_request_id -> {child_request_id, ...}
+        self._children_of_parent: dict[str, set[str]] = defaultdict(set)
+
         # Per-step decision log. Enabled by HB_SCHEDULER_DECISION_LOG=1.
         # Records each request's admit/defer/skip/preempt reason so we can
         # explain batching choices alongside per-model counts in
@@ -465,6 +476,48 @@ class Scheduler(SchedulerInterface):
             # Do not schedule any requests when paused.
             token_budget = 0
 
+        # Per-bucket token budgets for dual-model per-step caps. None means no
+        # cap (treated as +inf below). See DualModelConfig field docs.
+        _dual_cfg = self.dual_model_config
+
+        def _bkt_budget(name: str) -> float:
+            if _dual_cfg is None:
+                return float("inf")
+            v = getattr(_dual_cfg, f"max_{name}_tokens_per_step", None)
+            return float(v) if v is not None else float("inf")
+
+        bkt_decode_prefill_budget = _bkt_budget("decode_prefill")
+        bkt_decode_loop_budget = _bkt_budget("decode_loop")
+        bkt_embed_prefill_budget = _bkt_budget("embed_prefill")
+
+        # Step-local flags for the no-double-prefill admission gate (Patch C).
+        # Set ONLY when a *fresh* prefill admission lands in the waiting-loop
+        # path this step. Chunked-prefill carry-over (running-loop) does NOT
+        # set these — under chunked prefill, every step has prefill chunks in
+        # running, so triggering on carry-over would defer all opposite-kind
+        # prefill admissions indefinitely. The semantically correct rule is
+        # "do not admit two *fresh* big GEMM-bound prefills as new starts in
+        # the same step". Carry-over chunks compose freely.
+        step_admitted_FRESH_decode_prefill = False
+        step_admitted_FRESH_embed_prefill = False
+
+        def _bucket_for(req: "Request") -> str:
+            """Classify a request into one of {decode_prefill, decode_loop,
+            embed_prefill} for per-bucket budget accounting."""
+            if (
+                _dual_cfg is not None
+                and req.model_id == _dual_cfg.embed_model_id
+            ):
+                return "embed_prefill"
+            return "decode_loop" if req.num_output_tokens > 0 else "decode_prefill"
+
+        def _bucket_remaining(bucket: str) -> float:
+            if bucket == "decode_loop":
+                return bkt_decode_loop_budget
+            if bucket == "embed_prefill":
+                return bkt_embed_prefill_budget
+            return bkt_decode_prefill_budget
+
         if self._decision_log_enabled:
             self._decision_step += 1
             self._decisions = []
@@ -511,6 +564,21 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+
+            # Per-bucket cap (dual-model per-step token cap, P2.4). Running
+            # set is decode-loop in our setup; clamp / skip if bucket full.
+            _running_bucket = _bucket_for(request)
+            _running_bkt_remaining = _bucket_remaining(_running_bucket)
+            if num_new_tokens > _running_bkt_remaining:
+                if _running_bkt_remaining <= 0:
+                    self._log_decision(
+                        request.request_id,
+                        f"DEFER_BUCKET_{_running_bucket.upper()}",
+                        num_new_tokens,
+                    )
+                    req_index += 1
+                    continue
+                num_new_tokens = int(_running_bkt_remaining)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -629,6 +697,17 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            # Decrement per-bucket budget (dual-model per-step cap, P2.4).
+            # Note: do NOT set step_admitted_FRESH_*_prefill here — running-
+            # loop entries are carry-over (chunked-prefill continuations or
+            # in-flight prefills), not fresh admissions. The NDP gate fires
+            # only on fresh admissions, which happen in the waiting loop.
+            if _running_bucket == "decode_loop":
+                bkt_decode_loop_budget -= num_new_tokens
+            elif _running_bucket == "embed_prefill":
+                bkt_embed_prefill_budget -= num_new_tokens
+            else:
+                bkt_decode_prefill_budget -= num_new_tokens
             req_index += 1
             self._log_decision(request_id, "ADMIT_RUNNING", num_new_tokens)
 
@@ -697,6 +776,46 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                # KV-pressure gate. Defer NEW admissions from the waiting
+                # queue when the KV cache is at/above the configured
+                # threshold. Running requests still carry over freely — this
+                # only blocks fresh prefills from claiming blocks during the
+                # pair-dep release cascade (where many decode children land
+                # in the waiting queue simultaneously and would otherwise
+                # overcommit the KV cache in a single step).
+                if (
+                    _dual_cfg is not None
+                    and _dual_cfg.kv_pressure_skip_threshold is not None
+                    and self.kv_cache_manager.usage
+                    >= _dual_cfg.kv_pressure_skip_threshold
+                ):
+                    self._log_decision(request_id, "DEFER_KV_PRESSURE")
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                # No-double-prefill admission gate (Patch C). Block a *fresh*
+                # embed-prefill admission this step if a *fresh* decode-prefill
+                # has already been admitted (waiting-loop new admission), and
+                # symmetrically. Carry-over (already in `running`, including
+                # chunked-prefill continuations) does NOT trigger the gate —
+                # see the comment near the flag declaration.
+                if _dual_cfg is not None and _dual_cfg.enforce_no_double_prefill:
+                    _ndp_bucket = _bucket_for(request)
+                    if (
+                        _ndp_bucket == "embed_prefill"
+                        and step_admitted_FRESH_decode_prefill
+                    ) or (
+                        _ndp_bucket == "decode_prefill"
+                        and step_admitted_FRESH_embed_prefill
+                    ):
+                        self._log_decision(
+                            request_id, "DEFER_NO_DOUBLE_PREFILL"
+                        )
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -814,6 +933,26 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+
+                # Per-bucket cap (dual-model per-step token cap, P2.4).
+                # If this request's bucket is exhausted, defer to skipped
+                # queue (don't break — other-bucket requests may still fit).
+                _waiting_bucket = _bucket_for(request)
+                _waiting_bkt_remaining = _bucket_remaining(_waiting_bucket)
+                if num_new_tokens > _waiting_bkt_remaining:
+                    if (
+                        not self.scheduler_config.enable_chunked_prefill
+                        or _waiting_bkt_remaining <= 0
+                    ):
+                        self._log_decision(
+                            request_id,
+                            f"DEFER_BUCKET_{_waiting_bucket.upper()}",
+                            num_new_tokens,
+                        )
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                    num_new_tokens = int(_waiting_bkt_remaining)
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -950,6 +1089,18 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request_id] = self._get_request_blocks(request_id)
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # Decrement per-bucket budget (dual-model per-step cap, P2.4).
+                # Set step_admitted_FRESH_* — this is a fresh admission from
+                # the waiting queue, the only path that should trip the
+                # no-double-prefill gate.
+                if _waiting_bucket == "decode_loop":
+                    bkt_decode_loop_budget -= num_new_tokens
+                elif _waiting_bucket == "embed_prefill":
+                    bkt_embed_prefill_budget -= num_new_tokens
+                    step_admitted_FRESH_embed_prefill = True
+                else:
+                    bkt_decode_prefill_budget -= num_new_tokens
+                    step_admitted_FRESH_decode_prefill = True
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -1226,6 +1377,58 @@ class Scheduler(SchedulerInterface):
             return True
 
         return False
+
+    def _should_gate_child_on_parent(self, request: Request) -> bool:
+        """Return True if `request` should be held in _gated_children.
+
+        The gate fires only when:
+          - DualModelConfig.enforce_pair_dependency is True,
+          - the request carries a parent_request_id,
+          - the parent is still tracked in self.requests, AND
+          - the parent has not yet finished.
+
+        If the parent is unknown or already finished, the dependency is
+        considered satisfied and the request falls through to the legacy
+        waiting enqueue.
+        """
+        parent_id = getattr(request, "parent_request_id", None)
+        if parent_id is None:
+            return False
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or not dual_cfg.enforce_pair_dependency:
+            return False
+        parent = self.requests.get(parent_id)
+        if parent is None:
+            return False
+        # Parent could be in any state; if already finished it's already been
+        # / about to be _free_request'd. Treat finished == satisfied.
+        return not parent.is_finished()
+
+    def _release_gated_children(
+        self, parent_id: str, parent_status: RequestStatus
+    ) -> None:
+        """Resolve any children of a just-finished parent.
+
+        If parent finished normally → children move to self.waiting.
+        If parent was aborted        → children are aborted too (cascade).
+        """
+        child_ids = self._children_of_parent.pop(parent_id, None)
+        if not child_ids:
+            return
+        cascade_abort = parent_status == RequestStatus.FINISHED_ABORTED
+        for child_id in list(child_ids):
+            child = self._gated_children.pop(child_id, None)
+            if child is None:
+                continue
+            if cascade_abort:
+                child.status = RequestStatus.FINISHED_ABORTED
+                # _free_request will recursively cascade to grandchildren and
+                # remove the child from self.requests via _free_blocks.
+                self._free_request(child)
+                self._log_decision(child_id, "ABORTED_PARENT_ABORTED")
+            else:
+                self._enqueue_waiting_request(child)
+                self._log_decision(child_id, "RELEASED_PARENT_DONE")
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -2089,8 +2292,21 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
-            self.requests[request.request_id] = request
+            # RAG pair-dependency gate: hold child in _gated_children until
+            # parent finishes. Falls through to legacy enqueue if the gate is
+            # disabled, the parent is unknown, or the parent is already done.
+            if self._should_gate_child_on_parent(request):
+                self._gated_children[request.request_id] = request
+                self._children_of_parent[request.parent_request_id].add(
+                    request.request_id
+                )
+                self.requests[request.request_id] = request
+                self._log_decision(
+                    request.request_id, "GATED_PARENT_PENDING"
+                )
+            else:
+                self._enqueue_waiting_request(request)
+                self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -2172,6 +2388,9 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+
+        # Release any RAG-style children whose parent just finished.
+        self._release_gated_children(request_id, request.status)
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:

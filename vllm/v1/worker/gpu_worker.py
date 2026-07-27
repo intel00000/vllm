@@ -781,7 +781,24 @@ class Worker(WorkerBase):
         if not self.profiler and not emit_fallback:
             return nullcontext()
 
-        iteration_details = compute_iteration_details(scheduler_output)
+        # Pass dual-model context info if the runner has it. DualModelRunner
+        # exposes `req_id_to_model_id` and `dual_cfg.embed_model_id`. Single-
+        # model runners don't have these; for those we use the runner's
+        # is_pooling_model flag to bucket context as ectx_* (pooling/embed
+        # baseline) or dctx_* (generative baseline).
+        rid_to_mid = getattr(self.model_runner, "req_id_to_model_id", None)
+        dual_cfg = getattr(self.model_runner, "dual_cfg", None)
+        embed_model_id = getattr(dual_cfg, "embed_model_id", None) if dual_cfg else None
+        single_runner_kind: str | None = None
+        if rid_to_mid is None and dual_cfg is None:
+            if getattr(self.model_runner, "is_pooling_model", False):
+                single_runner_kind = "pooling"
+        iteration_details = compute_iteration_details(
+            scheduler_output,
+            req_id_to_model_id=rid_to_mid,
+            embed_model_id=embed_model_id,
+            single_runner_kind=single_runner_kind,
+        )
 
         self._sched_step += 1
 
@@ -794,11 +811,15 @@ class Worker(WorkerBase):
             [
                 "step_",
                 str(self._sched_step),
-                "_execute_context_",
-                str(iteration_details.num_ctx_requests),
+                "_dctx_",
+                str(iteration_details.num_decode_ctx_requests),
                 "(",
-                str(iteration_details.num_ctx_tokens),
-                ")_generation_",
+                str(iteration_details.num_decode_ctx_tokens),
+                ")_ectx_",
+                str(iteration_details.num_embed_ctx_requests),
+                "(",
+                str(iteration_details.num_embed_ctx_tokens),
+                ")_dgen_",
                 str(iteration_details.num_generation_requests),
                 "(",
                 str(iteration_details.num_generation_tokens),

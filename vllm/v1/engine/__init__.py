@@ -104,6 +104,13 @@ class EngineCoreRequest(
     priority: int = 0
     model_id: str | None = None
 
+    # Optional dependency: this request becomes eligible for scheduling only
+    # after the parent request (referenced by request_id) has finished. Used
+    # for RAG-style pipelines (paired embed+decode). The scheduler enforces
+    # the gate when DualModelConfig.enforce_pair_dependency is set; otherwise
+    # this field is informational only.
+    parent_request_id: str | None = None
+
     trace_headers: Mapping[str, str] | None = None
     resumable: bool = False
 

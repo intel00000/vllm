@@ -429,48 +429,128 @@ class IterationDetails:
     num_generation_requests: int
     num_generation_tokens: int
     max_seq_tokens: int = 0
+    # Dual-model split of the context/prefill bucket. When `embed_model_id` is
+    # not provided to compute_iteration_details, embed_* fields stay at 0 and
+    # decode_ctx_* mirrors num_ctx_*.
+    num_decode_ctx_requests: int = 0
+    num_decode_ctx_tokens: int = 0
+    num_embed_ctx_requests: int = 0
+    num_embed_ctx_tokens: int = 0
 
     def __repr__(self) -> str:
-        return f"IterationDetails(num_ctx_requests={self.num_ctx_requests},\
-                 num_ctx_tokens={self.num_ctx_tokens}, \
-                 num_generation_requests={self.num_generation_requests}, \
-                 num_generation_tokens={self.num_generation_tokens}, \
-                 max_seq_tokens={self.max_seq_tokens})"
+        return (
+            f"IterationDetails(num_ctx_requests={self.num_ctx_requests},"
+            f" num_ctx_tokens={self.num_ctx_tokens},"
+            f" num_generation_requests={self.num_generation_requests},"
+            f" num_generation_tokens={self.num_generation_tokens},"
+            f" num_decode_ctx_requests={self.num_decode_ctx_requests},"
+            f" num_decode_ctx_tokens={self.num_decode_ctx_tokens},"
+            f" num_embed_ctx_requests={self.num_embed_ctx_requests},"
+            f" num_embed_ctx_tokens={self.num_embed_ctx_tokens},"
+            f" max_seq_tokens={self.max_seq_tokens})"
+        )
 
 
-def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDetails:
+def compute_iteration_details(
+    scheduler_output: SchedulerOutput,
+    req_id_to_model_id: dict[str, str] | None = None,
+    embed_model_id: str | None = None,
+    single_runner_kind: str | None = None,
+) -> IterationDetails:
     """
     Compute the number of context/generation requests and tokens
-    for the current iteration's scheduler output. A requests is regarded
-    as a context request if its output tokens are still 0, an extended chunk
+    for the current iteration's scheduler output. A request is regarded
+    as a context request if its output tokens are still 0; an extended chunk
     of chunked prefill falls into this category.
+
+    When `req_id_to_model_id` and `embed_model_id` are provided (dual-model
+    runs), the context bucket is further split into decode-prefill (model_id
+    != embed_model_id) and embed-prefill (model_id == embed_model_id).
+
+    For single-model runs (no dual_cfg), `single_runner_kind` selects which
+    bucket to mirror context into:
+      - "pooling" (or "embed") → bucket as embed_ctx_* (e.g. embed-only baseline R2)
+      - any other value (or None) → bucket as decode_ctx_* (legacy default)
 
     Args:
         scheduler_output: The scheduler output for the current iteration.
+        req_id_to_model_id: Optional dict mapping request_id → model_id. The
+            dual_model worker maintains this; for single-model runs pass None.
+        embed_model_id: Optional model_id of the embed runner in dual-model
+            mode. Pass None for single-model runs.
+        single_runner_kind: Optional hint for the single-model case. Pass
+            "pooling" (or "embed") for an embed-only run so prefill activity
+            is reported as ectx_* instead of dctx_*. Default None → treat
+            single-model context as decode-prefill (legacy behavior).
 
     Returns:
         An IterationDetails object containing the number of
-        context/generation requests and tokens.
+        context/generation requests and tokens, plus the decode/embed
+        split of the context bucket when dual-model info is provided.
     """
     num_context_requests = 0
     num_context_tokens = 0
     num_generation_requests = 0
     num_generation_tokens = 0
-    new_req_ids = {new_req.req_id for new_req in scheduler_output.scheduled_new_reqs}
+    num_decode_ctx_requests = 0
+    num_decode_ctx_tokens = 0
+    num_embed_ctx_requests = 0
+    num_embed_ctx_tokens = 0
+    dual_mode = req_id_to_model_id is not None and embed_model_id is not None
+
+    # Per-step override: scheduled_new_reqs carry model_id directly. The
+    # persistent req_id_to_model_id dict is only populated by the runner during
+    # execute_model, which runs AFTER this helper. Without consulting the new-
+    # reqs list here, freshly-admitted embed prefills get bucketed as decode
+    # prefill because they're not yet in the persistent dict.
+    new_req_model_id: dict[str, str] = {
+        r.req_id: r.model_id for r in scheduler_output.scheduled_new_reqs
+    }
+    new_req_ids = set(new_req_model_id)
+
     for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
         if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id) or (
             req_id in new_req_ids
         ):
             num_context_requests += 1
             num_context_tokens += num_tokens
+            if dual_mode:
+                model_id = new_req_model_id.get(req_id) or req_id_to_model_id.get(
+                    req_id
+                )
+                if model_id == embed_model_id:
+                    num_embed_ctx_requests += 1
+                    num_embed_ctx_tokens += num_tokens
+                else:
+                    # decode model or unknown — bucket as decode prefill
+                    num_decode_ctx_requests += 1
+                    num_decode_ctx_tokens += num_tokens
         else:
             num_generation_requests += 1
             num_generation_tokens += num_tokens
     max_seq_tokens = max(scheduler_output.num_scheduled_tokens.values(), default=0)
+
+    if not dual_mode:
+        # In single-model mode, mirror context bucket into the kind that
+        # matches the runner. Default is decode_ctx_* (the historical behavior).
+        # For embed-only runs (e.g. R2), pass single_runner_kind="pooling" so
+        # the NVTX label reads ectx_* — otherwise embed prefills appear under
+        # the dctx_ field, which is misleading.
+        if single_runner_kind in ("pooling", "embed"):
+            num_embed_ctx_requests = num_context_requests
+            num_embed_ctx_tokens = num_context_tokens
+        else:
+            num_decode_ctx_requests = num_context_requests
+            num_decode_ctx_tokens = num_context_tokens
+
     return IterationDetails(
-        num_context_requests,
-        num_context_tokens,
-        num_generation_requests,
-        num_generation_tokens,
-        max_seq_tokens,
+        num_ctx_requests=num_context_requests,
+        num_ctx_tokens=num_context_tokens,
+        num_generation_requests=num_generation_requests,
+        num_generation_tokens=num_generation_tokens,
+        max_seq_tokens=max_seq_tokens,
+        num_decode_ctx_requests=num_decode_ctx_requests,
+        num_decode_ctx_tokens=num_decode_ctx_tokens,
+        num_embed_ctx_requests=num_embed_ctx_requests,
+        num_embed_ctx_tokens=num_embed_ctx_tokens,
     )
