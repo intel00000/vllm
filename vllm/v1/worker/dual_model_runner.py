@@ -7,6 +7,7 @@ import concurrent.futures
 import copy
 import inspect
 import os
+import threading
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from typing import Any
@@ -43,6 +44,41 @@ def _nvtx_range(name: str):
         yield
     finally:
         torch.cuda.nvtx.range_pop()
+
+
+_CUBLAS_LIB = None
+
+
+def _set_current_thread_cublas_sm_target(sm_target: int) -> None:
+    """sm-lever-sweep: apply cublasSetSmCountTarget to the CURRENT thread's
+    cuBLAS handle -- a best-effort soft hint that steers cuBLASLt toward a
+    fewer-CTA GEMM variant, freeing SMs for the concurrent decode stream.
+    Call on the role's executor thread AFTER a warm matmul has created the
+    handle; cuBLAS handles are per-thread so this scopes to that role only.
+    No-op for sm_target <= 0 (default) -> byte-identical to stock."""
+    if not sm_target or sm_target <= 0:
+        return
+    import ctypes
+    global _CUBLAS_LIB
+    try:
+        if _CUBLAS_LIB is None:
+            _CUBLAS_LIB = ctypes.CDLL("libcublas.so.12")
+        handle = torch.cuda.current_blas_handle()
+        status = _CUBLAS_LIB.cublasSetSmCountTarget(
+            ctypes.c_void_p(handle), ctypes.c_int(int(sm_target))
+        )
+        if status != 0:
+            logger.warning(
+                "cublasSetSmCountTarget(%d) -> status %d (hint ignored)",
+                sm_target, status,
+            )
+        else:
+            logger.info(
+                "embed cuBLAS SM target = %d on thread %s",
+                sm_target, threading.current_thread().name,
+            )
+    except Exception as e:  # never let an experiment hook break the run
+        logger.warning("cublasSetSmCountTarget failed: %s", e)
 
 
 _ASYNC_OUTPUT_STREAM_ATTRS = ("async_output_copy_stream", "output_copy_stream")
@@ -210,6 +246,7 @@ class DualModelRunner:
         executor: concurrent.futures.ThreadPoolExecutor,
         work_stream: WorkStream,
         device: torch.device,
+        sm_target: int = 0,
     ) -> None:
         """Touch CUDA on the executor's worker thread under
         ``work_stream.context()`` so cuBLAS creates its per-thread handle
@@ -222,6 +259,9 @@ class DualModelRunner:
                 a = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
                 b = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
                 _ = torch.matmul(a, b)
+                # sm-lever-sweep: pin this thread's cuBLAS handle to a reduced
+                # SM-count target (embed role only; no-op when sm_target<=0).
+                _set_current_thread_cublas_sm_target(sm_target)
                 torch.cuda.current_stream().synchronize()
         executor.submit(_warm).result()
 
@@ -263,14 +303,28 @@ class DualModelRunner:
         # Warm cuBLAS / per-thread state on each executor thread under
         # the role's WorkStream context -- both the partitioned ws AND its
         # full-SM fallback, since a role thread runs on either across steps.
+        try:
+            embed_cublas_sm_target = int(
+                os.environ.get("VLLM_EMBED_CUBLAS_SM_TARGET", "0"))
+        except ValueError:
+            embed_cublas_sm_target = 0
+        # sm-lever-sweep: self-labeling NVTX tag for the active levers.
+        self._lever_tag = (
+            f"cublas={os.environ.get('VLLM_EMBED_CUBLAS_SM_TARGET', 'off')},"
+            f"fa={os.environ.get('VLLM_FA_SM_MARGIN', 'off')},"
+            f"ws={os.environ.get('VLLM_WORK_STREAM_BACKEND', 'none')}"
+        )
         self._warm_role_thread(self._decode_executor, decode_ws, self.device)
-        self._warm_role_thread(self._embed_executor, embed_ws, self.device)
+        self._warm_role_thread(
+            self._embed_executor, embed_ws, self.device,
+            sm_target=embed_cublas_sm_target)
         if decode_ws.full_fallback is not None:
             self._warm_role_thread(
                 self._decode_executor, decode_ws.full_fallback, self.device)
         if embed_ws.full_fallback is not None:
             self._warm_role_thread(
-                self._embed_executor, embed_ws.full_fallback, self.device)
+                self._embed_executor, embed_ws.full_fallback, self.device,
+                sm_target=embed_cublas_sm_target)
 
     def _select_active_ws(self, has_decode_work: bool, has_embed_work: bool) -> None:
         """Pick each role's WorkStream for this step: the partitioned ws only
@@ -677,7 +731,7 @@ class DualModelRunner:
         # the main thread's subsequent operations).
         def run_decode() -> tuple[ModelRunnerOutput | None, torch.cuda.Event]:
             with self._decode_ctx():
-                with _nvtx_range("decode_execute"):
+                with _nvtx_range(f"decode_execute[{getattr(self, '_lever_tag', '')}]"):
                     out = self.decode_runner.execute_model(
                         split_outputs.decode,
                         intermediate_tensors=intermediate_tensors,
@@ -688,7 +742,7 @@ class DualModelRunner:
 
         def run_embed() -> tuple[ModelRunnerOutput | None, torch.cuda.Event]:
             with self._embed_ctx():
-                with _nvtx_range("embed_execute"):
+                with _nvtx_range(f"embed_execute[{getattr(self, '_lever_tag', '')}]"):
                     out = self.embed_runner.execute_model(
                         split_outputs.embed,
                     )
