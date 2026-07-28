@@ -7,8 +7,12 @@
 import torch
 
 # sm-lever-sweep experiment: FA3 SM-margin env gate (see _effective_sm_margin)
+import logging
 import os
 import threading
+
+# Threads that have already logged an active FA3 sm_margin (one-shot).
+_SM_MARGIN_LOGGED: set[str] = set()
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -150,7 +154,17 @@ def _effective_sm_margin(explicit: int = 0) -> int:
         m = int(raw)
     except ValueError:
         return 0
-    return m if m > 0 else 0
+    if m > 0:
+        # One-shot runtime evidence per thread that the margin is live --
+        # without this, an fa-margin arm's job log is byte-identical to off
+        # and a mis-export is indistinguishable from a true null.
+        if tname not in _SM_MARGIN_LOGGED:
+            _SM_MARGIN_LOGGED.add(tname)
+            logging.getLogger(__name__).info(
+                "FA3 sm_margin=%d active on thread %s", m, tname
+            )
+        return m
+    return 0
 
 
 # NOTE only used in FA3
