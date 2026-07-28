@@ -123,27 +123,34 @@ def maybe_contiguous(x):
 
 
 def _effective_sm_margin(explicit: int = 0) -> int:
-    """sm-lever-sweep experiment hook: cap FA3 SMs for the EMBED role only.
+    """sm-lever-sweep experiment hook: per-ROLE FA3 SM margins.
 
-    Returns ``explicit`` when >0; otherwise reads ``VLLM_FA_SM_MARGIN`` but only
-    honors it on the dedicated embed executor thread (name prefix ``dual_embed``),
-    so decode's (cudagraph-captured) attention always stays at sm_margin=0.
-    Default (env unset) returns 0 -> byte-identical to stock behavior. Both the
-    forward and get_scheduler_metadata derive their margin here, so the AOT
-    schedule and the launch always agree on num_sm.
+    Returns ``explicit`` when >0; otherwise reads a role-scoped env on the
+    dual-model executor threads: ``VLLM_FA_SM_MARGIN`` on the embed thread
+    (prefix ``dual_embed``) and ``VLLM_GEN_FA_SM_MARGIN`` on the gen/decode
+    thread (prefix ``dual_decode``). NOTE: in the single-engine runner gen
+    prefill + decode share forwards, so the gen margin caps the WHOLE gen
+    model's attention (defensible on Hopper: decode is SM-insensitive).
+    Defaults (env unset) return 0 -> byte-identical to stock. Both the forward
+    and get_scheduler_metadata derive their margin here, so the AOT schedule
+    and the launch always agree on num_sm.
     """
     if explicit and explicit > 0:
         return explicit
-    raw = os.environ.get("VLLM_FA_SM_MARGIN")
+    tname = threading.current_thread().name
+    if tname.startswith("dual_embed"):
+        raw = os.environ.get("VLLM_FA_SM_MARGIN")
+    elif tname.startswith("dual_decode"):
+        raw = os.environ.get("VLLM_GEN_FA_SM_MARGIN")
+    else:
+        return 0
     if not raw:
         return 0
     try:
         m = int(raw)
     except ValueError:
         return 0
-    if m <= 0:
-        return 0
-    return m if threading.current_thread().name.startswith("dual_embed") else 0
+    return m if m > 0 else 0
 
 
 # NOTE only used in FA3
