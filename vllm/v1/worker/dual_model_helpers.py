@@ -464,6 +464,11 @@ def split_scheduler_output_by_model(
         kv_connector_metadata=scheduler_output.kv_connector_metadata,
         ec_connector_metadata=scheduler_output.ec_connector_metadata,
         new_block_ids_to_zero=scheduler_output.new_block_ids_to_zero,
+        # Partial-prefix-hit copy-on-write block copies (v0.26). Only the
+        # decode model persists KV across steps, so the copies belong to its
+        # runner; dropping them would leave CoW destination blocks
+        # uninitialized on any sub-block prefix-cache hit.
+        kv_cache_block_copies=scheduler_output.kv_cache_block_copies,
     )
     embed_output = SchedulerOutput(
         scheduled_new_reqs=embed_new_reqs,

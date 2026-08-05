@@ -1034,7 +1034,10 @@ class Worker(WorkerBase):
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:
         """Get encoder timing stats from model runner."""
-        return self.model_runner.get_encoder_timing_stats()
+        # Only the legacy runner implements this; the V2 runner has no
+        # encoder timing collection.
+        stats_fn = getattr(self.model_runner, "get_encoder_timing_stats", None)
+        return stats_fn() if stats_fn is not None else {}
 
     def annotate_profile(self, scheduler_output):
         # Add a trace annotation so we can distinguish

@@ -97,7 +97,9 @@ def _temporary_async_outputs(runner: GPUModelRunner, enabled: bool):
     (`async_output_copy_stream` vs `output_copy_stream`) — we patch whichever
     one the runner exposes.
     """
-    old_value = runner.use_async_scheduling
+    # v0.26 removed the flag: sample_tokens always returns AsyncOutput and the
+    # copy stream/event exist unconditionally, so there is nothing to flip.
+    old_value = getattr(runner, "use_async_scheduling", None)
     if enabled:
         for attr in _ASYNC_OUTPUT_STREAM_ATTRS:
             if hasattr(runner, attr) and getattr(runner, attr) is None:
@@ -107,11 +109,13 @@ def _temporary_async_outputs(runner: GPUModelRunner, enabled: bool):
             and getattr(runner, "prepare_inputs_event") is None
         ):
             runner.prepare_inputs_event = torch.Event()
-        runner.use_async_scheduling = True
+        if old_value is not None:
+            runner.use_async_scheduling = True
     try:
         yield
     finally:
-        runner.use_async_scheduling = old_value
+        if old_value is not None:
+            runner.use_async_scheduling = old_value
 
 
 def _resolve_model_runner_output(
@@ -130,7 +134,9 @@ class DualModelRunner:
     EMBED_MODEL_PREFIX = "embed_model"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        if not envs.VLLM_USE_V2_MODEL_RUNNER:
+        # envs.VLLM_USE_V2_MODEL_RUNNER is tri-state since v0.26; the resolved
+        # decision lives on the config.
+        if not vllm_config.use_v2_model_runner:
             raise ValueError("DualModelRunner currently requires V2 model runner.")
         if vllm_config.scheduler_config.async_scheduling:
             raise ValueError(
@@ -983,3 +989,13 @@ class DualModelRunner:
 
     def take_draft_token_ids(self):
         return self.decode_runner.take_draft_token_ids()
+
+    def shutdown(self) -> None:
+        # __getattr__ would forward this to the decode runner only, leaking
+        # the embed model's weights and executor threads.
+        for runner in (self.decode_runner, self.embed_runner):
+            shutdown_fn = getattr(runner, "shutdown", None)
+            if shutdown_fn is not None:
+                shutdown_fn()
+        self._decode_executor.shutdown(wait=True)
+        self._embed_executor.shutdown(wait=True)

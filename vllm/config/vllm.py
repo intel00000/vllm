@@ -1103,6 +1103,14 @@ class VllmConfig:
                     "DP+EP generation accuracy."
                 )
                 self.scheduler_config.async_scheduling = False
+            elif isinstance(self.additional_config, dict) and self.additional_config.get(
+                "dual_model"
+            ):
+                logger.warning_once(
+                    "Async scheduling is disabled for dual-model runs "
+                    "(DualModelRunner drives a synchronous step loop)."
+                )
+                self.scheduler_config.async_scheduling = False
             else:
                 self.scheduler_config.async_scheduling = True
 
