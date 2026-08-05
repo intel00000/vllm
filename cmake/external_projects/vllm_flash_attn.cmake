@@ -41,6 +41,8 @@ else()
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
           GIT_TAG caaa4eb59845388a20b1f435ecaafb4bd9517ad8
           GIT_PROGRESS TRUE
+          # Skip the FA3 instantiation farm when no sm_90 target is requested
+          PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_LIST_DIR}/../patches/fa3_arch_gate.cmake
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
