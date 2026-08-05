@@ -1130,8 +1130,13 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    # FA3 needs an sm_90 target: cmake/patches/fa3_arch_gate.cmake skips the
+    # _vllm_fa3_C target when TORCH_CUDA_ARCH_LIST has no 9.0 entry, so don't
+    # ask ninja for it either (unset arch list keeps upstream behavior).
+    _fa3_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+    _fa3_arch_ok = "9.0" in _fa3_arch_list if _fa3_arch_list else True
     if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3") and _fa3_arch_ok
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
