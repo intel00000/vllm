@@ -264,6 +264,12 @@ class Scheduler(SchedulerInterface):
         # slackserve format (<stem>.llm.jsonl prefill/decode, <stem>.embed.jsonl
         # embed) so slackserve/three_stream_rates.py reads our runs unchanged.
         # Scheduled-token basis, same as the slackserve controller's publish log.
+        # slackserve port S4: requests currently in flight on a lane ticket.
+        # schedule() advances logical token counts at schedule time, before the
+        # GPU work completes -- a second schedule() seeing those counts would
+        # misclassify a mid-flight prefill as decode-ready, so in-flight ids
+        # are excluded from every lane until their ticket completes.
+        self._lane_inflight_req_ids: set[str] = set()
         self._toklog_stem = os.environ.get("HB_TOKLOG")
         self._toklog_prefill_cum = 0
         self._toklog_decode_cum = 0
@@ -512,7 +518,14 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(
+        self, throttle_prefills: bool = False, lane: str = "default"
+    ) -> SchedulerOutput:
+        # slackserve port S4: `lane` restricts this pass to one dispatch track
+        # (phase/model filter over the SAME queues -- see lane_accepts). The
+        # default lane is byte-identical to pre-lane behavior. Callers other
+        # than the lane controller never pass `lane`.
+        assert lane in ("default", "decode", "prefill", "embed"), lane
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -610,6 +623,11 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if lane != "default" and not self.lane_accepts(request, lane):
+                # Another lane's work (or in flight on one). Skip, don't stop.
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -849,7 +867,13 @@ class Scheduler(SchedulerInterface):
 
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            # The decode lane never admits WAITING requests: admission implies
+            # a prefill, which belongs to the prefill/embed lanes.
+            while (
+                lane != "decode"
+                and (self.waiting or self.skipped_waiting)
+                and token_budget > 0
+            ):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -866,6 +890,14 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # Lane filter FIRST: a request that belongs to another lane
+                # (or is in flight on one) must not tick the admission gates'
+                # state machines below.
+                if lane != "default" and not self.lane_accepts(request, lane):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # Embed-side admission gate. Pop deferred embeds into
                 # step_skipped_waiting so the scan continues with the
@@ -1955,6 +1987,37 @@ class Scheduler(SchedulerInterface):
                 + "\n"
             )
             self._toklog_embed_file.flush()
+
+    def lane_accepts(self, request: Request, lane: str) -> bool:
+        """Which dispatch track may schedule this request right now.
+
+        embed lane: embed-model requests. decode lane: gen requests whose
+        prompt is fully computed. prefill lane: the remaining gen requests.
+        A gen request migrates prefill->decode mid-life with no re-enqueue --
+        this is a filter over the shared queues, not a queue membership.
+        """
+        if request.request_id in self._lane_inflight_req_ids:
+            return False
+        if lane == "default":
+            return True
+        is_embed = (
+            self.dual_model_config is not None
+            and request.model_id == self.dual_model_config.embed_model_id
+        )
+        if lane == "embed":
+            return is_embed
+        if is_embed:
+            return False
+        decode_ready = request.num_computed_tokens >= request.num_prompt_tokens
+        return decode_ready if lane == "decode" else not decode_ready
+
+    def mark_lane_inflight(self, req_ids: Iterable[str]) -> None:
+        overlap = self._lane_inflight_req_ids.intersection(req_ids)
+        assert not overlap, f"requests double-scheduled across lanes: {overlap}"
+        self._lane_inflight_req_ids.update(req_ids)
+
+    def release_lane_inflight(self, req_ids: Iterable[str]) -> None:
+        self._lane_inflight_req_ids.difference_update(req_ids)
 
     def update_from_output(
         self,

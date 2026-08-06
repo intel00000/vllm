@@ -267,6 +267,11 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # slackserve port S4: which dispatch track produced this output
+    # ("default" = the pre-lane single-step path). Stamped by the lane
+    # controller at dispatch; the worker routes streams/threads by it.
+    execution_lane: str = "default"
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
