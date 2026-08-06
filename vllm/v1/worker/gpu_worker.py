@@ -1217,6 +1217,11 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    def execute_lane(self, scheduler_output: "SchedulerOutput"):
+        """Dispatch one lane ticket (VLLM_DUAL_LANES); returns a Future from
+        the DualModelRunner's pinned per-lane thread."""
+        return self.model_runner.execute_lane(scheduler_output)
+
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:

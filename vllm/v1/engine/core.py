@@ -8,7 +8,8 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
-from concurrent.futures import Future
+from concurrent.futures import FIRST_COMPLETED, Future
+from concurrent.futures import wait as futures_wait
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from functools import partial
@@ -251,6 +252,31 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        # Ticket-per-lane controller for dual-model runs (VLLM_DUAL_LANES=1):
+        # one in-flight ticket per lane, decode published first, one prefill
+        # dispatch per pass hidden behind a fresh decode dispatch, embed
+        # gap-fitted onto the dense stream when no prefill ticket is in
+        # flight.
+        self._lanes_enabled = (
+            os.environ.get("VLLM_DUAL_LANES") == "1"
+            and isinstance(vllm_config.additional_config, dict)
+            and bool(vllm_config.additional_config.get("dual_model"))
+        )
+        if self._lanes_enabled:
+            assert self.batch_queue is None, "lanes require batch_queue_size 1"
+            self._lane_tickets: dict[str, Any] = {
+                "decode": None, "prefill": None, "embed": None
+            }
+            self._lane_blocked: dict[str, bool] = {
+                "decode": False, "prefill": False, "embed": False
+            }
+            block_size = vllm_config.cache_config.block_size
+            max_sched = vllm_config.scheduler_config.max_num_batched_tokens
+            frac = float(os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or 0)
+            self._lane_watermark_frac = frac
+            self._lane_watermark_auto = -(-max_sched // block_size) + 256
+            self._lane_watermark_skips = 0
+            self.step_fn = self.step_lanes
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -655,6 +681,136 @@ class EngineCore:
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    _LANE_SCAN_ORDER = ("decode", "prefill", "embed")
+
+    def _lane_dispatch(self, lane: str) -> None:
+        scheduler_output = self.scheduler.schedule(lane=lane)
+        scheduler_output.execution_lane = lane
+        if scheduler_output.has_structured_output_requests:
+            raise NotImplementedError(
+                "VLLM_DUAL_LANES does not support structured output yet."
+            )
+        self.scheduler.mark_lane_inflight(scheduler_output.num_scheduled_tokens)
+        try:
+            future = self.model_executor.collective_rpc(
+                "execute_lane", args=(scheduler_output,), single_value=True
+            )
+        except Exception:
+            self.scheduler.release_lane_inflight(
+                scheduler_output.num_scheduled_tokens
+            )
+            raise
+        self._lane_tickets[lane] = (scheduler_output, future)
+
+    def _lane_publish(
+        self, lane: str
+    ) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        scheduler_output, future = self._lane_tickets[lane]
+        self._lane_tickets[lane] = None
+        try:
+            model_output = future.result()
+        finally:
+            self.scheduler.release_lane_inflight(
+                scheduler_output.num_scheduled_tokens
+            )
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            # Real work completed: whatever blocked a lane (KV pressure,
+            # gated admission) may have been freed.
+            for name in self._lane_blocked:
+                self._lane_blocked[name] = False
+        else:
+            # Empty dispatch: latch the lane until any productive publish.
+            self._lane_blocked[lane] = True
+        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _lane_prefill_headroom_ok(self) -> bool:
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        if self._lane_watermark_frac > 0:
+            unit = int(block_pool.num_gpu_blocks * self._lane_watermark_frac)
+        else:
+            unit = self._lane_watermark_auto
+        inflight_prefills = 1 if self._lane_tickets["prefill"] is not None else 0
+        return block_pool.get_num_free_blocks() >= unit * (inflight_prefills + 1)
+
+    def step_lanes(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """Ticket-per-lane controller: at most one publish per call so the
+        busy loop keeps admitting input between publishes."""
+        tickets = self._lane_tickets
+        if not self.scheduler.has_requests() and not any(tickets.values()):
+            return {}, False
+
+        # (a) Publish the first completed ticket; decode wins ties, and a
+        # completed prefill/embed never waits behind a running decode.
+        for lane in self._LANE_SCAN_ORDER:
+            ticket = tickets[lane]
+            if ticket is not None and ticket[1].done():
+                return self._lane_publish(lane)
+
+        # (b) Decode dispatches whenever decode-ready work exists.
+        decode_dispatched = False
+        if (
+            tickets["decode"] is None
+            and not self._lane_blocked["decode"]
+            and self.scheduler.has_lane_work("decode")
+        ):
+            self._lane_dispatch("decode")
+            decode_dispatched = True
+
+        # (c) At most one prefill per pass, only right behind a fresh decode
+        # dispatch (or onto an idle decode lane): its host prep hides under
+        # the running decode step. Gated by the KV-block watermark so prefill
+        # cannot outrun decode's block frees into preemption.
+        if (
+            tickets["prefill"] is None
+            and not self._lane_blocked["prefill"]
+            and (decode_dispatched or tickets["decode"] is None)
+            and self.scheduler.has_lane_work("prefill")
+        ):
+            if self._lane_prefill_headroom_ok():
+                self._lane_dispatch("prefill")
+            else:
+                self._lane_watermark_skips += 1
+
+        # (c2) Embed gap-fits the dense stream: dispatch only when no prefill
+        # ticket is in flight (they share the stream; the launch mutex is the
+        # correctness backstop, this is the policy).
+        if (
+            tickets["embed"] is None
+            and not self._lane_blocked["embed"]
+            and tickets["prefill"] is None
+            and self.scheduler.has_lane_work("embed")
+        ):
+            self._lane_dispatch("embed")
+
+        # (d) Something in flight: wait briefly, then let the busy loop
+        # re-admit input.
+        inflight = [t[1] for t in tickets.values() if t is not None]
+        if inflight:
+            futures_wait(inflight, timeout=0.05, return_when=FIRST_COMPLETED)
+            return {}, False
+
+        # (e) Nothing in flight and nothing dispatched above. Finished-but-
+        # unpublished ids need one more pass through the worker; otherwise
+        # progress beats headroom: dispatch any latched-out lane ungated.
+        if self.scheduler.has_finished_requests():
+            self._lane_dispatch("decode")
+            return {}, False
+        for lane in ("prefill", "embed"):
+            if not self._lane_blocked[lane] and self.scheduler.has_lane_work(lane):
+                self._lane_dispatch(lane)
+                return {}, False
+        # Every lane latched with nothing in flight: no future publish exists
+        # to clear the latches, so reset them and yield briefly instead of
+        # spinning hot until new input arrives.
+        for name in self._lane_blocked:
+            self._lane_blocked[name] = False
+        time.sleep(0.001)
+        return {}, False
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,

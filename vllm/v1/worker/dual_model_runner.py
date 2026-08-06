@@ -26,6 +26,11 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.worker.dense_lane_lock import (
+    embed_launch_lock_acquire,
+    launch_lock_release,
+    prefill_launch_lock_acquire,
+)
 from vllm.v1.worker.dual_model_helpers import (
     DualModelConfig,
     merge_model_runner_outputs,
@@ -1036,6 +1041,77 @@ class DualModelRunner:
 
     def take_draft_token_ids(self):
         return self.decode_runner.take_draft_token_ids()
+
+    def execute_lane(
+        self, scheduler_output: SchedulerOutput
+    ) -> concurrent.futures.Future:
+        """Run one lane ticket on its pinned thread; Future resolves to the
+        ticket's fully host-resolved ModelRunnerOutput.
+
+        The controller owns dispatch policy (it avoids overlapping dense
+        launch windows in the common case); the launch mutex here is the
+        correctness backstop for the windows that do overlap.
+        """
+        assert self.lanes_enabled and self._prefill_executor is not None
+        lane = getattr(scheduler_output, "execution_lane", "default")
+        split_outputs = split_scheduler_output_by_model(
+            scheduler_output=scheduler_output,
+            req_id_to_model_id=self.req_id_to_model_id,
+            decode_model_id=self.dual_cfg.decode_model_id,
+            embed_model_id=self.dual_cfg.embed_model_id,
+            decode_kv_group_indices=self.decode_kv_group_indices,
+            embed_kv_group_indices=self.embed_kv_group_indices,
+        )
+
+        if lane == "embed":
+            embed_so = split_outputs.embed_output
+
+            def _run_embed_ticket():
+                embed_launch_lock_acquire()
+                try:
+                    with self._embed_ctx():
+                        with _nvtx_range("lane_embed_execute"):
+                            out = self.embed_runner.execute_model(embed_so)
+                            if embed_so.total_num_scheduled_tokens > 0:
+                                out = self.embed_runner.pool()
+                finally:
+                    launch_lock_release()
+                return _resolve_model_runner_output(out, "lane_embed_resolve")
+
+            return self._embed_executor.submit(_run_embed_ticket)
+
+        # Gen lanes: the projected output's execution_lane steers per-lane
+        # state inside LaneModelRunner (the split builds it with the default).
+        gen_so = split_outputs.decode_output
+        gen_so.execution_lane = lane
+
+        def _run_gen_ticket():
+            out = self.decode_runner.execute_model(gen_so)
+            if out is None and gen_so.total_num_scheduled_tokens > 0:
+                out = self.decode_runner.sample_tokens(None)
+            return out
+
+        if lane == "prefill":
+
+            def _run_prefill_ticket():
+                prefill_launch_lock_acquire()
+                try:
+                    with torch.cuda.stream(self.dense_stream):
+                        with _nvtx_range("lane_prefill_execute"):
+                            out = _run_gen_ticket()
+                finally:
+                    launch_lock_release()
+                return _resolve_model_runner_output(out, "lane_prefill_resolve")
+
+            return self._prefill_executor.submit(_run_prefill_ticket)
+
+        def _run_decode_ticket():
+            with self._decode_ctx():
+                with _nvtx_range("lane_decode_execute"):
+                    out = _run_gen_ticket()
+            return _resolve_model_runner_output(out, "lane_decode_resolve")
+
+        return self._decode_executor.submit(_run_decode_ticket)
 
     def shutdown(self) -> None:
         # __getattr__ would forward this to the decode runner only, leaking

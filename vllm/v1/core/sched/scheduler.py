@@ -2019,6 +2019,25 @@ class Scheduler(SchedulerInterface):
     def release_lane_inflight(self, req_ids: Iterable[str]) -> None:
         self._lane_inflight_req_ids.difference_update(req_ids)
 
+    def has_lane_work(self, lane: str) -> bool:
+        """Cheap dispatchability probe for the lane controller.
+
+        Approximate on purpose: admission gates may still defer everything
+        this reports (an empty dispatch then latches the lane blocked), but
+        it never misses real work.
+        """
+        for request in self.running:
+            if self.lane_accepts(request, lane):
+                return True
+        if lane == "decode":
+            # Decode never admits from waiting.
+            return False
+        for queue_ in (self.waiting, self.skipped_waiting):
+            for request in queue_:
+                if self.lane_accepts(request, lane):
+                    return True
+        return False
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
