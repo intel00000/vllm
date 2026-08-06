@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -364,6 +365,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
+
+        if self.is_pooling_model or os.environ.get("HB_PREFILL_SM_COUNT_TARGET"):
+            # slackserve port: opt pooling-model linears into the cuBLASLt
+            # SM-count-target path (HB_EMBED_SM_COUNT_TARGET), or explicitly
+            # opt in decoder prefill via HB_PREFILL_SM_COUNT_TARGET. No-op
+            # unless a target is set; ordinary decode engines untouched.
+            from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
+
+            register_embed_model(self.model)
+
         eplb_models_added |= self.eplb.maybe_register_model(
             self.model,
             self.model_config,
