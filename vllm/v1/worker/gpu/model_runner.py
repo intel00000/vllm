@@ -452,6 +452,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _stash_execute_state(self, state, dummy_run: bool = False) -> None:
         self.execute_model_state = state
 
+    def _lane_force_eager(self) -> bool:
+        return False
+
+    def _lane_skip_compiled(self) -> bool:
+        return False
+
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
@@ -1247,6 +1253,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        # Lane seam: the compiled callable's runtime buffers are single-owner;
+        # non-owning lanes bypass it (no-op without lanes).
+        skip_compiled = skip_compiled or self._lane_skip_compiled()
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
@@ -1255,7 +1264,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or self._lane_force_eager(),
             num_active_loras=num_active_loras,
         )
 

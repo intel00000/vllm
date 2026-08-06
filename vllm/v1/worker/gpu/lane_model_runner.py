@@ -119,14 +119,27 @@ class LaneModelRunner(GPUModelRunner):
                 "LaneModelRunner does not support MoE or DCP models "
                 "(shared WorkspaceManager slot across lanes)."
             )
-        cg_mode = vllm_config.compilation_config.cudagraph_mode
-        if cg_mode is not None and cg_mode != CUDAGraphMode.NONE:
-            # The cudagraph manager's captured buffers are single-owner;
-            # decode-exclusive graph ownership is a later stage. Until then,
-            # lanes require eager execution.
+        # Graph/compile exclusivity: captured graph buffers and the
+        # compiled callable's runtime buffers are single-owner. With
+        # HB_P2_DECODE_GRAPHS_ONLY=1 the decode lane owns both: prefill
+        # tickets are forced eager at dispatch and (with HB_P2_COMPILE_DECODE)
+        # bypass the compiled callable -- which also keeps prefill GEMMs on
+        # UnquantizedLinearMethod.apply, where the cuBLASLt SM-cap hook fires.
+        self._graphs_only = os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
+        self._compile_decode = os.environ.get("HB_P2_COMPILE_DECODE") == "1"
+        if self._compile_decode and not self._graphs_only:
             raise ValueError(
-                "VLLM_DUAL_LANES currently requires cudagraph_mode NONE "
-                f"(got {cg_mode})."
+                "HB_P2_COMPILE_DECODE requires HB_P2_DECODE_GRAPHS_ONLY=1."
+            )
+        cg_mode = vllm_config.compilation_config.cudagraph_mode
+        if (
+            cg_mode is not None
+            and cg_mode != CUDAGraphMode.NONE
+            and not self._graphs_only
+        ):
+            raise ValueError(
+                "VLLM_DUAL_LANES with cudagraphs requires "
+                f"HB_P2_DECODE_GRAPHS_ONLY=1 (got cudagraph_mode {cg_mode})."
             )
         super().__init__(vllm_config, device)
         self.lane_contexts: dict[str, LaneContext] = {
@@ -168,6 +181,27 @@ class LaneModelRunner(GPUModelRunner):
         lane = getattr(self._tl, "lane", None)
         return self.lane_contexts.get(lane) if lane is not None else None
 
+    def _lane_force_eager(self) -> bool:
+        return (
+            self._graphs_only
+            and getattr(self._tl, "lane", None) == LANE_PREFILL
+        )
+
+    def _lane_skip_compiled(self) -> bool:
+        return (
+            self._compile_decode
+            and getattr(self._tl, "lane", None) == LANE_PREFILL
+        )
+
+    def _fa3_builders(self):
+        builders = {}
+        for groups in getattr(self, "attn_groups", []) or []:
+            for group in groups:
+                builder = group.get_metadata_builder(0)
+                if getattr(builder, "use_full_cuda_graph", False):
+                    builders[id(builder)] = builder
+        return list(builders.values())
+
     def _host_prep_lock_acquire(self) -> None:
         self._gen_state_lock.acquire()
         self._tl.lock_held = True
@@ -176,6 +210,17 @@ class LaneModelRunner(GPUModelRunner):
             # Redirect the prepare path onto this lane's buffers. Safe: only
             # ever mutated with the lock held; decode's swap is the identity.
             self.input_buffers = context.input_buffers
+        if self._lane_force_eager():
+            # FA3's builder owns ONE persistent scheduler-metadata tensor when
+            # full-graph support is on; an eager prefill metadata build would
+            # overwrite it while a decode graph reads it. Flip the builders to
+            # the fresh-allocation path for this lane's build. Lock-scoped:
+            # the metadata build happens inside the locked prep, so decode
+            # can never observe the flipped value during its own build.
+            flipped = self._fa3_builders()
+            for builder in flipped:
+                builder.use_full_cuda_graph = False
+            self._tl.fa3_flipped = flipped
 
     def _host_prep_lock_release(self) -> None:
         # Idempotent: called at the pre-forward seam on the happy path and
@@ -183,6 +228,9 @@ class LaneModelRunner(GPUModelRunner):
         if not getattr(self._tl, "lock_held", False):
             return
         try:
+            for builder in getattr(self._tl, "fa3_flipped", ()):
+                builder.use_full_cuda_graph = True
+            self._tl.fa3_flipped = ()
             if self._tl_context() is not None:
                 # Every staged-transport consumer for this ticket is enqueued
                 # on the current (lane) stream; arm buffer-reuse events.
