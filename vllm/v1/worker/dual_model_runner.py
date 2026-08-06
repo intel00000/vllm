@@ -1064,7 +1064,7 @@ class DualModelRunner:
         )
 
         if lane == "embed":
-            embed_so = split_outputs.embed_output
+            embed_so = split_outputs.embed
 
             def _run_embed_ticket():
                 embed_launch_lock_acquire()
@@ -1082,7 +1082,7 @@ class DualModelRunner:
 
         # Gen lanes: the projected output's execution_lane steers per-lane
         # state inside LaneModelRunner (the split builds it with the default).
-        gen_so = split_outputs.decode_output
+        gen_so = split_outputs.decode
         gen_so.execution_lane = lane
 
         def _run_gen_ticket():
