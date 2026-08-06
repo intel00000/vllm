@@ -281,6 +281,22 @@ if TYPE_CHECKING:
     VLLM_LORA_DISABLE_PDL: bool = False
     VLLM_ENABLE_CUDA_COMPATIBILITY: bool = False
     VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
+    VLLM_WORK_STREAM_BACKEND: str | None = None
+    VLLM_WORK_STREAM_SMS: str | None = None
+    VLLM_DUAL_DECODE_SMS: str | None = None
+    VLLM_DUAL_EMBED_SMS: str | None = None
+    VLLM_LIBSMCTRL_LIB_PATH: str | None = None
+    VLLM_DUAL_SOLO_FALLBACK: str | None = None
+    VLLM_DUAL_MODEL_EXECUTE_ORDER: str | None = None
+    VLLM_DUAL_MODEL_STREAM_MODE: str | None = None
+    VLLM_DUAL_KV_OVERLAY: str | None = None
+    VLLM_DUAL_MODEL_SERIALIZE: str | None = None
+    VLLM_DUAL_SERIALIZE_MODE: str | None = None
+    VLLM_DUAL_MODEL_ASYNC_OUTPUTS: str | None = None
+    VLLM_FA_SM_MARGIN: str | None = None
+    VLLM_GEN_FA_SM_MARGIN: str | None = None
+    VLLM_GEN_CUBLAS_SM_TARGET: str | None = None
+    VLLM_EMBED_CUBLAS_SM_TARGET: str | None = None
     VLLM_SKIP_MODEL_NAME_VALIDATION: bool = False
     """If set, vLLM will skip model name validation in API requests.
     This allows any model name to be accepted in the 'model' field of requests,
@@ -2018,6 +2034,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # dual-model / work-stream experiment knobs
+    # Passthrough registrations: the code reads os.environ at use sites, these
+    # entries exist so validate_environ accepts the names.
+    "VLLM_WORK_STREAM_BACKEND": lambda: os.getenv("VLLM_WORK_STREAM_BACKEND"),
+    "VLLM_WORK_STREAM_SMS": lambda: os.getenv("VLLM_WORK_STREAM_SMS"),
+    "VLLM_DUAL_DECODE_SMS": lambda: os.getenv("VLLM_DUAL_DECODE_SMS"),
+    "VLLM_DUAL_EMBED_SMS": lambda: os.getenv("VLLM_DUAL_EMBED_SMS"),
+    "VLLM_LIBSMCTRL_LIB_PATH": lambda: os.getenv("VLLM_LIBSMCTRL_LIB_PATH"),
+    "VLLM_DUAL_SOLO_FALLBACK": lambda: os.getenv("VLLM_DUAL_SOLO_FALLBACK"),
+    "VLLM_DUAL_MODEL_EXECUTE_ORDER": lambda: os.getenv("VLLM_DUAL_MODEL_EXECUTE_ORDER"),
+    "VLLM_DUAL_MODEL_STREAM_MODE": lambda: os.getenv("VLLM_DUAL_MODEL_STREAM_MODE"),
+    "VLLM_DUAL_KV_OVERLAY": lambda: os.getenv("VLLM_DUAL_KV_OVERLAY"),
+    "VLLM_DUAL_MODEL_SERIALIZE": lambda: os.getenv("VLLM_DUAL_MODEL_SERIALIZE"),
+    "VLLM_DUAL_SERIALIZE_MODE": lambda: os.getenv("VLLM_DUAL_SERIALIZE_MODE"),
+    "VLLM_DUAL_MODEL_ASYNC_OUTPUTS": lambda: os.getenv("VLLM_DUAL_MODEL_ASYNC_OUTPUTS"),
+    "VLLM_FA_SM_MARGIN": lambda: os.getenv("VLLM_FA_SM_MARGIN"),
+    "VLLM_GEN_FA_SM_MARGIN": lambda: os.getenv("VLLM_GEN_FA_SM_MARGIN"),
+    "VLLM_GEN_CUBLAS_SM_TARGET": lambda: os.getenv("VLLM_GEN_CUBLAS_SM_TARGET"),
+    "VLLM_EMBED_CUBLAS_SM_TARGET": lambda: os.getenv("VLLM_EMBED_CUBLAS_SM_TARGET"),
 }
 
 

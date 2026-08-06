@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import os
 import time
 from collections import defaultdict, deque
@@ -259,6 +260,17 @@ class Scheduler(SchedulerInterface):
         self._decision_log_enabled = self._decision_log_level > 0
         self._decision_step: int = 0
         self._decisions: list[tuple[str, str, int]] = []
+        # HB_TOKLOG=<path stem>: cumulative three-stream token telemetry in the
+        # slackserve format (<stem>.llm.jsonl prefill/decode, <stem>.embed.jsonl
+        # embed) so slackserve/three_stream_rates.py reads our runs unchanged.
+        # Scheduled-token basis, same as the slackserve controller's publish log.
+        self._toklog_stem = os.environ.get("HB_TOKLOG")
+        self._toklog_prefill_cum = 0
+        self._toklog_decode_cum = 0
+        self._toklog_embed_cum = 0
+        self._toklog_llm_file: Any = None
+        self._toklog_embed_file: Any = None
+        self._toklog_llm_pending = 0
         # Level-3 KV breakdown, computed once/step in _flush_decision_log and
         # read by make_stats (same step, flush runs first). None otherwise.
         self._last_kv_breakdown: dict[str, Any] | None = None
@@ -1886,11 +1898,71 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _toklog_emit(self, scheduler_output: SchedulerOutput) -> None:
+        """Append cumulative per-stream token counts for this step.
+
+        Called before any request is freed so the final step of a finishing
+        request is still counted. A gen request's prompt-side share is the
+        overlap of this step's scheduled span with [0, num_prompt_tokens);
+        num_computed_tokens was already advanced at schedule time.
+        """
+        prefill = decode = embed = 0
+        dual_cfg = self.dual_model_config
+        for req_id, n in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if request is None or n <= 0:
+                continue
+            if dual_cfg is not None and request.model_id == dual_cfg.embed_model_id:
+                embed += n
+                continue
+            computed_after = request.num_computed_tokens
+            prompt_side = min(request.num_prompt_tokens, computed_after) - (
+                computed_after - n
+            )
+            prompt_side = max(0, min(n, prompt_side))
+            prefill += prompt_side
+            decode += n - prompt_side
+        if prefill or decode:
+            self._toklog_prefill_cum += prefill
+            self._toklog_decode_cum += decode
+            if self._toklog_llm_file is None:
+                self._toklog_llm_file = open(f"{self._toklog_stem}.llm.jsonl", "a")
+            self._toklog_llm_file.write(
+                json.dumps(
+                    {
+                        "t": time.monotonic(),
+                        "prefill_tokens_cum": self._toklog_prefill_cum,
+                        "decode_tokens_cum": self._toklog_decode_cum,
+                    }
+                )
+                + "\n"
+            )
+            self._toklog_llm_pending += 1
+            if self._toklog_llm_pending >= 20:
+                self._toklog_llm_file.flush()
+                self._toklog_llm_pending = 0
+        if embed:
+            self._toklog_embed_cum += embed
+            if self._toklog_embed_file is None:
+                self._toklog_embed_file = open(f"{self._toklog_stem}.embed.jsonl", "a")
+            self._toklog_embed_file.write(
+                json.dumps(
+                    {
+                        "t": time.perf_counter(),
+                        "embed_tokens_cum": self._toklog_embed_cum,
+                    }
+                )
+                + "\n"
+            )
+            self._toklog_embed_file.flush()
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self._toklog_stem:
+            self._toklog_emit(scheduler_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
