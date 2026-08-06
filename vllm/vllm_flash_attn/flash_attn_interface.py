@@ -7,12 +7,36 @@
 import torch
 
 # sm-lever-sweep experiment: FA3 SM-margin env gate (see _effective_sm_margin)
+import contextlib
+import contextvars
 import logging
 import os
 import threading
 
 # Threads that have already logged an active FA3 sm_margin (one-shot).
 _SM_MARGIN_LOGGED: set[str] = set()
+
+# slackserve port S3: lane-scoped margin override. The lane runner enters
+# lane_sm_margin(...) around prepare_attn + forward on its executor thread;
+# ContextVars are per-thread here, so lanes never see each other's margin.
+_LANE_SM_MARGIN: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "fa3_lane_sm_margin", default=None
+)
+
+
+@contextlib.contextmanager
+def lane_sm_margin(margin: int):
+    """Scope an FA3 sm_margin to the current lane/thread.
+
+    Takes precedence over the role-env resolution in _effective_sm_margin;
+    margin=0 means explicitly uncapped (overrides a role env). Explicit
+    per-call sm_margin arguments still win over this.
+    """
+    token = _LANE_SM_MARGIN.set(int(margin))
+    try:
+        yield
+    finally:
+        _LANE_SM_MARGIN.reset(token)
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -127,21 +151,31 @@ def maybe_contiguous(x):
 
 
 def _effective_sm_margin(explicit: int = 0) -> int:
-    """sm-lever-sweep experiment hook: per-ROLE FA3 SM margins.
+    """sm-lever-sweep experiment hook: per-ROLE / per-LANE FA3 SM margins.
 
-    Returns ``explicit`` when >0; otherwise reads a role-scoped env on the
-    dual-model executor threads: ``VLLM_FA_SM_MARGIN`` on the embed thread
-    (prefix ``dual_embed``) and ``VLLM_GEN_FA_SM_MARGIN`` on the gen/decode
-    thread (prefix ``dual_decode``). NOTE: in the single-engine runner gen
-    prefill + decode share forwards, so the gen margin caps the WHOLE gen
-    model's attention (defensible on Hopper: decode is SM-insensitive).
-    Defaults (env unset) return 0 -> byte-identical to stock. Both the forward
-    and get_scheduler_metadata derive their margin here, so the AOT schedule
-    and the launch always agree on num_sm.
+    Precedence: ``explicit`` (>0) > lane context (``lane_sm_margin``, S3;
+    0 there = explicitly uncapped) > role-scoped env by executor-thread
+    prefix: ``VLLM_FA_SM_MARGIN`` on ``dual_embed`` threads,
+    ``VLLM_GEN_FA_SM_MARGIN`` on ``dual_decode`` threads. NOTE: without the
+    lane split, gen prefill + decode share forwards, so the gen margin caps
+    the WHOLE gen model's attention (defensible on Hopper: decode is
+    SM-insensitive); the lane runner scopes margins per lane instead.
+    Defaults (nothing set) return 0 -> byte-identical to stock. Both the
+    forward and get_scheduler_metadata derive their margin here, so the AOT
+    schedule and the launch always agree on num_sm.
     """
     if explicit and explicit > 0:
         return explicit
     tname = threading.current_thread().name
+    lane_margin = _LANE_SM_MARGIN.get()
+    if lane_margin is not None:
+        m = lane_margin if lane_margin > 0 else 0
+        if m > 0 and f"lane:{tname}" not in _SM_MARGIN_LOGGED:
+            _SM_MARGIN_LOGGED.add(f"lane:{tname}")
+            logging.getLogger(__name__).info(
+                "FA3 sm_margin=%d active via lane context on thread %s", m, tname
+            )
+        return m
     if tname.startswith("dual_embed"):
         raw = os.environ.get("VLLM_FA_SM_MARGIN")
     elif tname.startswith("dual_decode"):
