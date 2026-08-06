@@ -1063,6 +1063,34 @@ class DualModelRunner:
             embed_kv_group_indices=self.embed_kv_group_indices,
         )
 
+        # Cross-model finished/preempted delivery: each lane ticket executes
+        # ONE runner, but the scheduler attaches finished ids for BOTH models
+        # to whichever output it emits next. Route the counterpart's
+        # (zero-token) half to its runner so its request slots free -- found
+        # by the full-dataset OL sweep as a slot leak ("No free indices"):
+        # gen finishes riding embed tickets were never delivered.
+        def _counterpart_cleanup(lane_name):
+            other_so = (
+                split_outputs.decode if lane_name == "embed"
+                else split_outputs.embed
+            )
+            if not (
+                other_so.finished_req_ids
+                or (other_so.preempted_req_ids or set())
+            ):
+                return None
+            assert other_so.total_num_scheduled_tokens == 0
+            if lane_name == "embed":
+                return self._decode_executor.submit(
+                    lambda: self.decode_runner.execute_model(other_so)
+                )
+
+            def _embed_cleanup():
+                with self._embed_ctx():
+                    return self.embed_runner.execute_model(other_so)
+
+            return self._embed_executor.submit(_embed_cleanup)
+
         if lane == "embed":
             embed_so = split_outputs.embed
 
@@ -1076,8 +1104,11 @@ class DualModelRunner:
                                 out = self.embed_runner.pool()
                 finally:
                     launch_lock_release()
+                if cleanup_future is not None:
+                    cleanup_future.result()
                 return _resolve_model_runner_output(out, "lane_embed_resolve")
 
+            cleanup_future = _counterpart_cleanup("embed")
             return self._embed_executor.submit(_run_embed_ticket)
 
         # Gen lanes: the projected output's execution_lane steers per-lane
@@ -1101,16 +1132,22 @@ class DualModelRunner:
                             out = _run_gen_ticket()
                 finally:
                     launch_lock_release()
+                if cleanup_future is not None:
+                    cleanup_future.result()
                 return _resolve_model_runner_output(out, "lane_prefill_resolve")
 
+            cleanup_future = _counterpart_cleanup(lane)
             return self._prefill_executor.submit(_run_prefill_ticket)
 
         def _run_decode_ticket():
             with self._decode_ctx():
                 with _nvtx_range("lane_decode_execute"):
                     out = _run_gen_ticket()
+            if cleanup_future is not None:
+                cleanup_future.result()
             return _resolve_model_runner_output(out, "lane_decode_resolve")
 
+        cleanup_future = _counterpart_cleanup(lane)
         return self._decode_executor.submit(_run_decode_ticket)
 
     def shutdown(self) -> None:

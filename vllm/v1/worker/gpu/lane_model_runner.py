@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
@@ -140,6 +140,19 @@ class LaneModelRunner(GPUModelRunner):
             raise ValueError(
                 "VLLM_DUAL_LANES with cudagraphs requires "
                 f"HB_P2_DECODE_GRAPHS_ONLY=1 (got cudagraph_mode {cg_mode})."
+            )
+        comp_mode = vllm_config.compilation_config.mode
+        if (
+            comp_mode is not None
+            and comp_mode != CompilationMode.NONE
+            and not self._compile_decode
+        ):
+            # The inductor callable's runtime buffers are single-owner; with
+            # compilation on, both lanes would enter it concurrently unless
+            # decode owns it exclusively.
+            raise ValueError(
+                "VLLM_DUAL_LANES with compilation requires "
+                "HB_P2_COMPILE_DECODE=1 (single-owner compiled callable)."
             )
         super().__init__(vllm_config, device)
         self.lane_contexts: dict[str, LaneContext] = {
