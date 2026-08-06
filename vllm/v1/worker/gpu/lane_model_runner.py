@@ -100,6 +100,21 @@ class LaneModelRunner(GPUModelRunner):
     """
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # v0.26's module-global WorkspaceManager keys its slot by the DBO
+        # thread registry, which maps unregistered threads to slot 0, and two
+        # lanes would silently alias MoE/DCP/sparse-attn workspace.
+        hf_config = vllm_config.model_config.hf_config
+        num_experts = getattr(hf_config, "num_experts", None) or getattr(
+            hf_config, "num_local_experts", None
+        )
+        dcp_size = getattr(
+            vllm_config.parallel_config, "decode_context_parallel_size", 1
+        )
+        if num_experts or (dcp_size and dcp_size > 1):
+            raise ValueError(
+                "LaneModelRunner does not support MoE or DCP models "
+                "(shared WorkspaceManager slot across lanes)."
+            )
         super().__init__(vllm_config, device)
         self.lane_contexts: dict[str, LaneContext] = {
             LANE_DECODE: LaneContext(

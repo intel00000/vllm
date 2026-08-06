@@ -281,6 +281,7 @@ if TYPE_CHECKING:
     VLLM_LORA_DISABLE_PDL: bool = False
     VLLM_ENABLE_CUDA_COMPATIBILITY: bool = False
     VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
+    VLLM_DUAL_LANES: str | None = None
     VLLM_WORK_STREAM_BACKEND: str | None = None
     VLLM_WORK_STREAM_SMS: str | None = None
     VLLM_DUAL_DECODE_SMS: str | None = None
@@ -2037,6 +2038,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dual-model / work-stream experiment knobs
     # Passthrough registrations: the code reads os.environ at use sites, these
     # entries exist so validate_environ accepts the names.
+    "VLLM_DUAL_LANES": lambda: os.getenv("VLLM_DUAL_LANES"),
     "VLLM_WORK_STREAM_BACKEND": lambda: os.getenv("VLLM_WORK_STREAM_BACKEND"),
     "VLLM_WORK_STREAM_SMS": lambda: os.getenv("VLLM_WORK_STREAM_SMS"),
     "VLLM_DUAL_DECODE_SMS": lambda: os.getenv("VLLM_DUAL_DECODE_SMS"),

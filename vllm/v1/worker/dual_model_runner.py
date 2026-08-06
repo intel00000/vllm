@@ -213,7 +213,31 @@ class DualModelRunner:
         self.vllm_config = vllm_config
         self.dual_cfg = dual_cfg
         self.device = device
-        self.decode_runner = GPUModelRunner(vllm_config, device)
+        # slackserve port: VLLM_DUAL_LANES=1 splits the gen model into
+        # prefill/decode dispatch lanes. The gen runner then needs per-lane
+        # execution contexts; unset keeps the plain runner and none of the
+        # lane code loads.
+        self.lanes_enabled = os.environ.get("VLLM_DUAL_LANES") == "1"
+        if self.lanes_enabled:
+            # Two lanes = up to two outstanding staging-consumption windows on
+            # the gen runner's shared UVA pools (one in-flight ticket each).
+            # Depth 2 would make a decode dispatch wrap onto a buffer whose
+            # prefill consumers may still be queued -> fence-wait couples
+            # decode's host cadence to prefill's stream latency. Depth 4 gives
+            # two wrap cycles of slack; cost is KB-scale pinned host memory
+            # (only the small staging pools are round-robin'd).
+            from vllm.v1.worker.gpu.buffer_utils import (
+                set_default_max_concurrency,
+            )
+
+            set_default_max_concurrency(4)
+            from vllm.v1.worker.gpu.lane_model_runner import LaneModelRunner
+
+            self.decode_runner: GPUModelRunner = LaneModelRunner(
+                vllm_config, device
+            )
+        else:
+            self.decode_runner = GPUModelRunner(vllm_config, device)
         self.embed_vllm_config = self._build_embed_vllm_config(vllm_config, dual_cfg)
         self.embed_runner = GPUModelRunner(self.embed_vllm_config, device)
 
@@ -246,6 +270,16 @@ class DualModelRunner:
         self._embed_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="dual_embed"
         )
+        # slackserve port: the prefill lane gets its own pinned thread for
+        # the same cuBLAS-handle reasons as above. Its launches target the
+        # DENSE stream (= the embed role's stream, see set_work_streams);
+        # launch windows against the embed thread are serialized by
+        # dense_lane_lock.
+        self._prefill_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        if self.lanes_enabled:
+            self._prefill_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="dual_prefill"
+            )
 
     @staticmethod
     def _warm_role_thread(
@@ -340,6 +374,19 @@ class DualModelRunner:
             self._warm_role_thread(
                 self._embed_executor, embed_ws.full_fallback, self.device,
                 sm_target=embed_cublas_sm_target)
+        # slackserve port: the prefill lane launches onto the DENSE
+        # stream, which is the embed role's stream. This sharing is the
+        # design (embed can only overlap decode; prefill launch windows are
+        # serialized against embed's by dense_lane_lock).
+        if self._prefill_executor is not None:
+            self.dense_stream = embed_ws.stream
+            self._warm_role_thread(
+                self._prefill_executor, embed_ws, self.device,
+                sm_target=gen_cublas_sm_target)
+            if embed_ws.full_fallback is not None:
+                self._warm_role_thread(
+                    self._prefill_executor, embed_ws.full_fallback, self.device,
+                    sm_target=gen_cublas_sm_target)
 
     def _select_active_ws(self, has_decode_work: bool, has_embed_work: bool) -> None:
         """Pick each role's WorkStream for this step: the partitioned ws only
@@ -999,3 +1046,5 @@ class DualModelRunner:
                 shutdown_fn()
         self._decode_executor.shutdown(wait=True)
         self._embed_executor.shutdown(wait=True)
+        if self._prefill_executor is not None:
+            self._prefill_executor.shutdown(wait=True)
