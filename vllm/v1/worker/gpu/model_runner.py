@@ -440,6 +440,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """
         self.__dict__["main_stream"] = stream
 
+    # Lane seams (no-ops here). LaneModelRunner overrides these to serialize
+    # the shared-host state-update + prep phase across lanes and to keep the
+    # forward->sample handoff per-lane. See execute_model for call sites.
+    def _host_prep_lock_acquire(self) -> None:
+        pass
+
+    def _host_prep_lock_release(self) -> None:
+        pass
+
+    def _stash_execute_state(self, state, dummy_run: bool = False) -> None:
+        self.execute_model_state = state
+
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
@@ -1199,6 +1211,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Host-prep guard: no-op here; the lane runner serializes the shared
+        # state-update + prep phase across lanes (released before the forward).
+        self._host_prep_lock_acquire()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1209,6 +1224,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
+                self._host_prep_lock_release()
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
@@ -1245,6 +1261,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
+            self._host_prep_lock_release()
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
@@ -1363,6 +1380,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        # All shared-host mutation and every staged-consumer enqueue is done;
+        # the forward reads only captured refs + stable .gpu handles.
+        self._host_prep_lock_release()
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1419,13 +1440,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         finished_req_ids = scheduler_output.finished_req_ids
-        self.execute_model_state = ExecuteModelState(
-            input_batch=input_batch,
-            attn_metadata=attn_metadata,
-            slot_mappings_by_layer=slot_mappings_by_layer,
-            hidden_states=hidden_states,
-            aux_hidden_states=aux_hidden_states,
-            finished_req_ids=finished_req_ids,
+        # Routed through a hook: with lanes, the shared attribute slot would
+        # be clobbered by a concurrently-returning lane.
+        self._stash_execute_state(
+            ExecuteModelState(
+                input_batch=input_batch,
+                attn_metadata=attn_metadata,
+                slot_mappings_by_layer=slot_mappings_by_layer,
+                hidden_states=hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                finished_req_ids=finished_req_ids,
+            ),
+            dummy_run=dummy_run,
         )
 
         if not self.is_last_pp_rank:

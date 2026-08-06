@@ -16,16 +16,20 @@ never touch the captured tensors (never call get_dummy_*).
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import os
+import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.vllm_flash_attn.flash_attn_interface import lane_sm_margin
 
 logger = init_logger(__name__)
 
@@ -115,6 +119,15 @@ class LaneModelRunner(GPUModelRunner):
                 "LaneModelRunner does not support MoE or DCP models "
                 "(shared WorkspaceManager slot across lanes)."
             )
+        cg_mode = vllm_config.compilation_config.cudagraph_mode
+        if cg_mode is not None and cg_mode != CUDAGraphMode.NONE:
+            # The cudagraph manager's captured buffers are single-owner;
+            # decode-exclusive graph ownership is a later stage. Until then,
+            # lanes require eager execution.
+            raise ValueError(
+                "VLLM_DUAL_LANES currently requires cudagraph_mode NONE "
+                f"(got {cg_mode})."
+            )
         super().__init__(vllm_config, device)
         self.lane_contexts: dict[str, LaneContext] = {
             LANE_DECODE: LaneContext(
@@ -131,11 +144,119 @@ class LaneModelRunner(GPUModelRunner):
                 copy_event=torch.cuda.Event(),
             ),
         }
+        # Serializes the shared-host state-update + prep phase across lanes
+        # (base execute_model calls the acquire/release seams); re-taken for
+        # sample_tokens' shared-mutation tail. Recreates the single-host-
+        # thread invariant the slackserve design has by construction.
+        self._gen_state_lock = threading.Lock()
+        # Per-thread active lane: each lane's ticket runs execute+sample on
+        # its own pinned executor thread.
+        self._tl = threading.local()
+        self.fa_sm_margin = {
+            LANE_DECODE: int(os.environ.get("HB_P2_FA_SM_MARGIN_DECODE", "0") or 0),
+            LANE_PREFILL: int(
+                os.environ.get("HB_P2_FA_SM_MARGIN_PREFILL", "0") or 0
+            ),
+        }
         logger.info(
             "LaneModelRunner: %s lanes (decode = base buffers, prefill = "
             "private scratch)",
             list(self.lane_contexts),
         )
+
+    def _tl_context(self) -> LaneContext | None:
+        lane = getattr(self._tl, "lane", None)
+        return self.lane_contexts.get(lane) if lane is not None else None
+
+    def _host_prep_lock_acquire(self) -> None:
+        self._gen_state_lock.acquire()
+        self._tl.lock_held = True
+        context = self._tl_context()
+        if context is not None:
+            # Redirect the prepare path onto this lane's buffers. Safe: only
+            # ever mutated with the lock held; decode's swap is the identity.
+            self.input_buffers = context.input_buffers
+
+    def _host_prep_lock_release(self) -> None:
+        # Idempotent: called at the pre-forward seam on the happy path and
+        # from execute_model's finally for early returns and exceptions.
+        if not getattr(self._tl, "lock_held", False):
+            return
+        try:
+            if self._tl_context() is not None:
+                # Every staged-transport consumer for this ticket is enqueued
+                # on the current (lane) stream; arm buffer-reuse events.
+                fence_uva_pools(torch.cuda.current_stream(self.device))
+                self.input_buffers = self.lane_contexts[
+                    LANE_DECODE
+                ].input_buffers
+        finally:
+            self._tl.lock_held = False
+            self._gen_state_lock.release()
+
+    def _stash_execute_state(self, state, dummy_run: bool = False) -> None:
+        context = self._tl_context()
+        if context is None:
+            self.execute_model_state = state
+            return
+        context.execute_model_state = state
+        if dummy_run:
+            # Profiling warmup reads the shared slot directly; the following
+            # dummy sampler run consumes and clears it.
+            self.execute_model_state = state
+
+    def execute_model(self, scheduler_output, *args, **kwargs):
+        lane = self.lane_for(scheduler_output)
+        context = self.lane_contexts[lane]
+        self._tl.lane = lane
+        margin = self.fa_sm_margin.get(lane, 0)
+        margin_ctx = lane_sm_margin(margin) if margin > 0 else nullcontext()
+        try:
+            with margin_ctx:
+                result = super().execute_model(scheduler_output, *args, **kwargs)
+        finally:
+            self._host_prep_lock_release()
+        context.main_stream = torch.cuda.current_stream(self.device)
+        context.completion_event.record(context.main_stream)
+        return result
+
+    def sample_tokens(self, grammar_output):
+        context = self._tl_context()
+        if context is None:
+            return super().sample_tokens(grammar_output)
+        # Whole-body lock: sampling reads shared sampler tables and its
+        # post_update mutates them.
+        with self._gen_state_lock:
+            prev_main = self.__dict__.get("main_stream")
+            prev_copy = self.output_copy_stream
+            if context.main_stream is not None:
+                self.__dict__["main_stream"] = context.main_stream
+                torch.cuda.current_stream(self.device).wait_event(
+                    context.completion_event
+                )
+            if context.copy_stream is not None:
+                self.output_copy_stream = context.copy_stream
+            self.execute_model_state = context.execute_model_state
+            context.execute_model_state = None
+            try:
+                result = super().sample_tokens(grammar_output)
+            finally:
+                if prev_main is not None:
+                    self.__dict__["main_stream"] = prev_main
+                self.output_copy_stream = prev_copy
+            # Re-record so controller readiness queries cover the full
+            # ticket (forward + sampling + postprocess).
+            context.completion_event.record(
+                torch.cuda.current_stream(self.device)
+            )
+            return result
+
+    def prepare_attn(self, input_batch: InputBatch):
+        context = self._tl_context()
+        if context is None or context.attn_scratch is None:
+            # Decode (or pre-KV-init dummy): base path, persistent buffers.
+            return super().prepare_attn(input_batch)
+        return context.attn_scratch.prepare(self.block_tables, input_batch)
 
     @staticmethod
     def lane_for(scheduler_output) -> str:
@@ -148,27 +269,3 @@ class LaneModelRunner(GPUModelRunner):
             if lane != LANE_DECODE:
                 context.attn_scratch = LaneAttentionScratch(self.block_tables)
         return result
-
-    @contextmanager
-    def _use_input_buffers(self, context: LaneContext):
-        """Scoped redirect of the prepare path onto the lane's buffers.
-
-        Base prepare_inputs writes exclusively through self.input_buffers
-        (verified at v0.26 -- no helper caches a reference), so an attribute
-        swap is sufficient and keeps the base method byte-identical for the
-        decode lane, whose context holds the base buffers anyway.
-        """
-        previous = self.input_buffers
-        self.input_buffers = context.input_buffers
-        try:
-            yield
-        finally:
-            self.input_buffers = previous
-
-    def _prepare_attn_for_lane(
-        self, context: LaneContext, input_batch: InputBatch
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        if context.attn_scratch is None:
-            # Decode (or pre-KV-init dummy): base path, persistent buffers.
-            return self.prepare_attn(input_batch)
-        return context.attn_scratch.prepare(self.block_tables, input_batch)
