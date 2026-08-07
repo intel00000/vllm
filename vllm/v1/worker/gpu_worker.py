@@ -1215,13 +1215,15 @@ class Worker(WorkerBase):
         with self._work_stream.context():
             return self.model_runner.sample_tokens(grammar_output)
 
-    @torch.inference_mode()
-    @with_gpu_sync_check
     def execute_lane(self, scheduler_output: "SchedulerOutput"):
         """Dispatch one lane ticket (VLLM_DUAL_LANES); returns a Future from
-        the DualModelRunner's pinned per-lane thread."""
+        the DualModelRunner's pinned per-lane thread. No inference_mode here:
+        the forwards run on the pinned lane threads, which wrap their own.
+        """
         return self.model_runner.execute_lane(scheduler_output)
 
+    @torch.inference_mode()
+    @with_gpu_sync_check
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
