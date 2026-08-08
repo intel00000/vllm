@@ -28,6 +28,7 @@ from vllm.logger import init_logger
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.attn_utils import set_lane_attn_builder_idx
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.vllm_flash_attn.flash_attn_interface import lane_sm_margin
 
@@ -102,6 +103,13 @@ class LaneModelRunner(GPUModelRunner):
     by DualModelRunner for the gen role when lanes are enabled; without lanes
     the plain GPUModelRunner is used and this class never loads.
     """
+
+    # S8: one attention-metadata builder per gen lane (decode=0, prefill=1),
+    # via the ubatch multi-builder mechanism. Isolates persistent builder
+    # state that the pre-forward lock release would otherwise share across
+    # concurrently executing lanes (FlashInfer index buffers/wrappers/float
+    # workspace; FA3 scheduler tensor).
+    lane_attn_builder_count = 2
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # v0.26's module-global WorkspaceManager keys its slot by the DBO
@@ -223,6 +231,17 @@ class LaneModelRunner(GPUModelRunner):
             # Redirect the prepare path onto this lane's buffers. Safe: only
             # ever mutated with the lock held; decode's swap is the identity.
             self.input_buffers = context.input_buffers
+            # S8: select this lane's private attention-metadata builder
+            # (decode=0, prefill=1). Backends with persistent builder state
+            # (FlashInfer paged_kv_* buffers + wrappers + float workspace,
+            # FA3 scheduler tensor) are lane-isolated by construction; the
+            # forward reads only refs captured into the built metadata.
+            set_lane_attn_builder_idx(
+                0 if getattr(self._tl, "lane", None) == LANE_DECODE else 1
+            )
+            if not getattr(self, "_s8_isolation_checked", False):
+                self._s8_isolation_checked = True
+                self._assert_lane_builder_isolation()
         if self._lane_force_eager():
             # FA3's builder owns ONE persistent scheduler-metadata tensor when
             # full-graph support is on; an eager prefill metadata build would
@@ -234,6 +253,28 @@ class LaneModelRunner(GPUModelRunner):
             for builder in flipped:
                 builder.use_full_cuda_graph = False
             self._tl.fa3_flipped = flipped
+
+    def _assert_lane_builder_isolation(self) -> None:
+        """One-time S8 invariant: per-lane builders share NO persistent GPU
+        state. Structural proof of memory safety -- token-level checks cannot
+        distinguish a race from FlashInfer's composition-dependent numerics.
+        """
+        for groups in getattr(self, "attn_groups", []) or []:
+            for group in groups:
+                if len(group.metadata_builders) < 2:
+                    continue
+                b0, b1 = group.metadata_builders[0], group.metadata_builders[1]
+                for attr in ("paged_kv_indptr", "paged_kv_indices",
+                             "paged_kv_last_page_len"):
+                    t0, t1 = getattr(b0, attr, None), getattr(b1, attr, None)
+                    if t0 is not None and t1 is not None:
+                        assert t0.gpu.data_ptr() != t1.gpu.data_ptr(), (
+                            "S8 violation: shared builder buffer", attr)
+                w0 = getattr(b0, "_workspace_buffer", None)
+                w1 = getattr(b1, "_workspace_buffer", None)
+                if w0 is not None and w1 is not None:
+                    assert w0.data_ptr() != w1.data_ptr(), (
+                        "S8 violation: shared float workspace")
 
     def _host_prep_lock_release(self) -> None:
         # Idempotent: called at the pre-forward seam on the happy path and

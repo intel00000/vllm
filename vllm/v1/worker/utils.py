@@ -248,6 +248,8 @@ class AttentionGroup:
     # When ubatching is enabled we will have a metadata builder for each ubatch
     # so that if they use internal persistent buffers for cudagraphs, and they
     # won't have to worry about conflicting with the other ubatches.
+    # Dual-model lanes reuse the same mechanism: one builder per gen lane
+    # (see gpu/attn_utils.set_lane_attn_builder_idx).
     metadata_builders: list[AttentionMetadataBuilder] = field(
         default_factory=lambda: []
     )

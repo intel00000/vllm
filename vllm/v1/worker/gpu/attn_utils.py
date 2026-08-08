@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextvars
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import prod
@@ -77,11 +78,27 @@ def get_shared_kv_cache_layers(vllm_config: VllmConfig):
     }
 
 
+# Lane-scoped metadata-builder selection (VLLM_DUAL_LANES). Builders are a
+# LIST per attention group (the ubatch mechanism); under lanes each gen lane
+# owns one builder so persistent builder state (FlashInfer paged_kv_* buffers,
+# wrappers, FA3 scheduler tensors) is never shared across concurrently
+# executing lanes. The var is set under the gen_state_lock at prep time; the
+# post-release forward reads only refs captured into the built metadata.
+_LANE_ATTN_BUILDER_IDX: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "lane_attn_builder_idx", default=0
+)
+
+
+def set_lane_attn_builder_idx(idx: int) -> None:
+    _LANE_ATTN_BUILDER_IDX.set(idx)
+
+
 def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
     device: torch.device,
     active_layer_names: set[str] | None = None,
+    num_metadata_builders: int = 1,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
@@ -133,7 +150,13 @@ def init_attn_backend(
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
-    attn_backend_workspace: torch.Tensor | None = None
+    # Workspace sharing is PER BUILDER INDEX: index-i builders share one
+    # buffer across attention groups (as before), never across indices --
+    # under lanes each index belongs to a different concurrently-executing
+    # lane and the float workspace is live split-KV scratch.
+    attn_backend_workspaces: list[torch.Tensor | None] = (
+        [None] * num_metadata_builders
+    )
     min_cg_support = AttentionCGSupport.ALWAYS
     min_cg_attn_backend = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
@@ -145,15 +168,27 @@ def init_attn_backend(
                 vllm_config=vllm_config,
                 device=device,
                 kernel_block_size=kernel_block_size,
-                num_metadata_builders=1,
+                num_metadata_builders=num_metadata_builders,
             )
+            for b_idx in range(num_metadata_builders):
+                b = group.get_metadata_builder(b_idx)
+                if b_idx > 0:
+                    # Non-decode lanes never own captured graphs: kill the
+                    # cudagraph wrapper paths structurally (FlashInfer
+                    # enable_cuda_graph, FA3 use_full_cuda_graph) so the
+                    # decode lane's captured buffer addresses are written by
+                    # its own builder only.
+                    if getattr(b, "enable_cuda_graph", False):
+                        b.enable_cuda_graph = False
+                    if getattr(b, "use_full_cuda_graph", False):
+                        b.use_full_cuda_graph = False
+                if attn_backend_workspaces[b_idx] is None:
+                    if hasattr(b, "_get_workspace_buffer"):
+                        attn_backend_workspaces[b_idx] = b._get_workspace_buffer()
+                else:
+                    if hasattr(b, "set_workspace_buffer"):
+                        b.set_workspace_buffer(attn_backend_workspaces[b_idx])
             builder = group.get_metadata_builder(0)
-            if attn_backend_workspace is None:
-                if hasattr(builder, "_get_workspace_buffer"):
-                    attn_backend_workspace = builder._get_workspace_buffer()
-            else:
-                if hasattr(builder, "set_workspace_buffer"):
-                    builder.set_workspace_buffer(attn_backend_workspace)
             # Check cudagraph support for the attention backend
             cg_support = builder.get_cudagraph_support(
                 vllm_config,
@@ -652,7 +687,13 @@ def build_attn_metadata(
         )
 
         for attn_group in attn_groups[i]:
-            attn_metadata_builder = attn_group.get_metadata_builder(0)
+            lane_idx = _LANE_ATTN_BUILDER_IDX.get()
+            builder_idx = min(lane_idx, len(attn_group.metadata_builders) - 1)
+            if for_cudagraph_capture:
+                assert builder_idx == 0, (
+                    "cudagraph capture must run with the decode-lane builder"
+                )
+            attn_metadata_builder = attn_group.get_metadata_builder(builder_idx)
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata

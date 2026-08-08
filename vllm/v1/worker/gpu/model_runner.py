@@ -503,7 +503,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group.append(max_num_blocks)
 
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
-            self.kv_cache_config, self.vllm_config, self.device
+            self.kv_cache_config, self.vllm_config, self.device,
+            num_metadata_builders=getattr(self, "lane_attn_builder_count", 1),
         )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
