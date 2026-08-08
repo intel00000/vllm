@@ -32,6 +32,12 @@ def set_default_max_concurrency(n: int) -> None:
 # host-synchronizes that event before the buffer is rewritten. Code that
 # never fences (the ordinary single-lane runner) behaves exactly as before.
 _dirty_pools: list["UvaBufferPool"] = []
+# Guards the registry against the append-vs-swap race (a lost append would
+# leave a pool permanently unfenced: its nonempty _dirty suppresses
+# re-registration). Pool-level _dirty gets its own lock -- lane threads add
+# concurrently with the fence's iterate+clear (observed: "Set changed size
+# during iteration", job 37766613).
+_registry_lock = threading.Lock()
 
 # Threads whose pools must never enter the fence registry (an in-process
 # second engine's drain thread: its pools would be fenced by the main
@@ -50,7 +56,8 @@ def _uva_fencing_enabled() -> bool:
 def fence_uva_pools(stream: torch.cuda.Stream | None = None) -> None:
     """Mark staged UVA buffers as consumed by kernels on ``stream``."""
     global _dirty_pools
-    pools, _dirty_pools = _dirty_pools, []
+    with _registry_lock:
+        pools, _dirty_pools = _dirty_pools, []
     for pool in pools:
         pool._record_pending(stream)
 
@@ -103,18 +110,23 @@ class UvaBufferPool:
         self._events: list[torch.cuda.Event | None] = [None] * max_concurrency
         self._event_pending = [False] * max_concurrency
         self._dirty: set[int] = set()
+        self._dirty_lock = threading.Lock()
 
     def _record_pending(self, stream: torch.cuda.Stream | None) -> None:
         if stream is None:
             stream = torch.cuda.current_stream()
-        for index in self._dirty:
+        with self._dirty_lock:
+            # Snapshot-and-clear atomically: adds racing this fence stay in
+            # the set for the NEXT fence (never lost, never iterated live).
+            dirty = list(self._dirty)
+            self._dirty.clear()
+        for index in dirty:
             event = self._events[index]
             if event is None:
                 event = torch.cuda.Event()
                 self._events[index] = event
             event.record(stream)
             self._event_pending[index] = True
-        self._dirty.clear()
 
     def copy_to_uva(self, x: torch.Tensor | np.ndarray | list) -> torch.Tensor:
         # Round robin to the next buffer.
@@ -125,9 +137,11 @@ class UvaBufferPool:
             self._events[self._curr].synchronize()
             self._event_pending[self._curr] = False
         if _uva_fencing_enabled():
-            if not self._dirty:
-                _dirty_pools.append(self)
-            self._dirty.add(self._curr)
+            with self._dirty_lock:
+                if not self._dirty:
+                    with _registry_lock:
+                        _dirty_pools.append(self)
+                self._dirty.add(self._curr)
         buf = self._uva_bufs[self._curr]
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
