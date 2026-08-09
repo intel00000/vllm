@@ -685,22 +685,33 @@ class EngineCore:
     _LANE_SCAN_ORDER = ("decode", "prefill", "embed")
 
     def _lane_dispatch(self, lane: str) -> None:
-        scheduler_output = self.scheduler.schedule(lane=lane)
+        # Decision-level NVTX (HB_ENGINE_CORE_NVTX_RANGES=1): lane_sched shows
+        # what the shared scheduler ADMITTED for this lane's ticket (reqs +
+        # token budget); lane_dispatch brackets the RPC hand-off. Together
+        # with the runner-side lane_*_execute/resolve ranges this makes each
+        # controller pass legible in the timeline.
+        with engine_core_nvtx_range(f"lane_sched[{lane}]"):
+            scheduler_output = self.scheduler.schedule(lane=lane)
         scheduler_output.execution_lane = lane
         if scheduler_output.has_structured_output_requests:
             raise NotImplementedError(
                 "VLLM_DUAL_LANES does not support structured output yet."
             )
         self.scheduler.mark_lane_inflight(scheduler_output.num_scheduled_tokens)
-        try:
-            future = self.model_executor.collective_rpc(
-                "execute_lane", args=(scheduler_output,), single_value=True
-            )
-        except Exception:
-            self.scheduler.release_lane_inflight(
-                scheduler_output.num_scheduled_tokens
-            )
-            raise
+        with engine_core_nvtx_range(
+            f"lane_dispatch[{lane}] "
+            f"reqs={len(scheduler_output.num_scheduled_tokens)} "
+            f"tok={scheduler_output.total_num_scheduled_tokens}"
+        ):
+            try:
+                future = self.model_executor.collective_rpc(
+                    "execute_lane", args=(scheduler_output,), single_value=True
+                )
+            except Exception:
+                self.scheduler.release_lane_inflight(
+                    scheduler_output.num_scheduled_tokens
+                )
+                raise
         self._lane_tickets[lane] = (scheduler_output, future)
 
     def _lane_publish(
@@ -708,16 +719,20 @@ class EngineCore:
     ) -> tuple[dict[int, EngineCoreOutputs], bool]:
         scheduler_output, future = self._lane_tickets[lane]
         self._lane_tickets[lane] = None
-        try:
-            model_output = future.result()
-        finally:
-            self.scheduler.release_lane_inflight(
-                scheduler_output.num_scheduled_tokens
+        with engine_core_nvtx_range(
+            f"lane_publish[{lane}] "
+            f"tok={scheduler_output.total_num_scheduled_tokens}"
+        ):
+            try:
+                model_output = future.result()
+            finally:
+                self.scheduler.release_lane_inflight(
+                    scheduler_output.num_scheduled_tokens
+                )
+            self._process_aborts_queue()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
             )
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
         if scheduler_output.total_num_scheduled_tokens > 0:
             # Real work completed: whatever blocked a lane (KV pressure,
             # gated admission) may have been freed.
