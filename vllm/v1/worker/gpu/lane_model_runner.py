@@ -135,6 +135,31 @@ class LaneModelRunner(GPUModelRunner):
         # UnquantizedLinearMethod.apply, where the cuBLASLt SM-cap hook fires.
         self._graphs_only = os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
         self._compile_decode = os.environ.get("HB_P2_COMPILE_DECODE") == "1"
+        # S9a: both lanes execute the compiled artifact. The artifact is
+        # re-entrant (inductor output allocates per call; DBO drives it from
+        # two threads); the single-owner hazard was the dispatcher, which
+        # this mode removes structurally: the bytecode hook (process-global
+        # __code__ swap per forward) must be OFF, and wrapper.py pins the
+        # process-global dynamo knobs once instead of per call.
+        self._compile_both = os.environ.get("HB_P2_COMPILE_BOTH") == "1"
+        if self._compile_both:
+            import vllm.envs as envs_mod
+            if envs_mod.VLLM_USE_BYTECODE_HOOK:
+                raise ValueError(
+                    "HB_P2_COMPILE_BOTH requires VLLM_USE_BYTECODE_HOOK=0 "
+                    "(the bytecode hook swaps cls.forward.__code__ process-"
+                    "wide per forward -- unsafe with two lane threads)."
+                )
+            if envs_mod.VLLM_USE_AOT_COMPILE:
+                raise ValueError(
+                    "HB_P2_COMPILE_BOTH is incompatible with "
+                    "VLLM_USE_AOT_COMPILE (process-global partition wrapper)."
+                )
+            if vllm_config.compilation_config.cudagraph_copy_inputs:
+                raise ValueError(
+                    "HB_P2_COMPILE_BOTH requires cudagraph_copy_inputs=False "
+                    "(shared static input buffers in the compiled path)."
+                )
         if self._compile_decode and not self._graphs_only:
             raise ValueError(
                 "HB_P2_COMPILE_DECODE requires HB_P2_DECODE_GRAPHS_ONLY=1."
@@ -153,14 +178,14 @@ class LaneModelRunner(GPUModelRunner):
         if (
             comp_mode is not None
             and comp_mode != CompilationMode.NONE
-            and not self._compile_decode
+            and not (self._compile_decode or self._compile_both)
         ):
-            # The inductor callable's runtime buffers are single-owner; with
-            # compilation on, both lanes would enter it concurrently unless
-            # decode owns it exclusively.
+            # Without COMPILE_BOTH the dispatcher is single-owner; decode
+            # must own the callable exclusively (COMPILE_DECODE) or lanes
+            # must stay uncompiled.
             raise ValueError(
                 "VLLM_DUAL_LANES with compilation requires "
-                "HB_P2_COMPILE_DECODE=1 (single-owner compiled callable)."
+                "HB_P2_COMPILE_DECODE=1 or HB_P2_COMPILE_BOTH=1."
             )
         super().__init__(vllm_config, device)
         self.lane_contexts: dict[str, LaneContext] = {
@@ -209,6 +234,11 @@ class LaneModelRunner(GPUModelRunner):
         )
 
     def _lane_skip_compiled(self) -> bool:
+        # S9a: under COMPILE_BOTH the prefill lane enters the compiled
+        # artifact too (it still never runs graphs -- _lane_force_eager
+        # keeps its cudagraph_runtime_mode NONE).
+        if self._compile_both:
+            return False
         return (
             self._compile_decode
             and getattr(self._tl, "lane", None) == LANE_PREFILL

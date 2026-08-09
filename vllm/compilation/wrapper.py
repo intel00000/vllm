@@ -23,6 +23,14 @@ R = TypeVar("R")
 P = ParamSpec("P")
 
 
+# S9a (HB_P2_COMPILE_BOTH): two lane threads enter the compiled callable
+# concurrently; the per-call set/RESTORE of process-global dynamo limits
+# below is a cross-thread race (one thread's finally can revert the limits
+# mid-call of the other). Under lanes the limits are pinned once instead.
+_LANES_COMPILE_BOTH = os.environ.get("HB_P2_COMPILE_BOTH") == "1"
+_dynamo_limits_pinned = False
+
+
 @contextmanager
 def _compilation_context() -> Generator[None, None, None]:
     """Context manager for compilation settings.
@@ -32,6 +40,14 @@ def _compilation_context() -> Generator[None, None, None]:
     Generally a recompilation can happen whenever we use a new
     backend instance in torch.compile.
     """
+    global _dynamo_limits_pinned
+    if _LANES_COMPILE_BOTH:
+        if not _dynamo_limits_pinned:
+            torch._dynamo.config.cache_size_limit = 2048
+            torch._dynamo.config.accumulated_cache_size_limit = 8192
+            _dynamo_limits_pinned = True
+        yield
+        return
     original_cache_size = torch._dynamo.config.cache_size_limit
     original_accumulated_cache = torch._dynamo.config.accumulated_cache_size_limit
 
@@ -189,9 +205,11 @@ class TorchCompileWithNoGuardsWrapper:
                         self.forward, *args, **kwargs
                     )
         else:
+            # set_stance is process-global: racy across lane threads.
             ctx = (
                 nullcontext()
-                if self.first_compile or not self.evaluate_guards
+                if _LANES_COMPILE_BOTH or self.first_compile
+                or not self.evaluate_guards
                 else torch.compiler.set_stance("fail_on_recompile")
             )
             self.first_compile = False
