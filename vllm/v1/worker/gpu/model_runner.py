@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+from contextlib import nullcontext
 import os
 import time
 from copy import deepcopy
@@ -451,6 +452,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _stash_execute_state(self, state, dummy_run: bool = False) -> None:
         self.execute_model_state = state
+
+    def _sampler_tail_ctx(self):
+        # Lane seam: shared-tail lock for postprocess_sampled (no-op without
+        # lanes; see LaneModelRunner).
+        return nullcontext()
+
+    def _host_prep_early_release(self) -> None:
+        # Lane seam: S9c-P2 early lock release after input build (no-op
+        # without lanes; see LaneModelRunner).
+        pass
 
     def _lane_force_eager(self) -> bool:
         return False
@@ -1279,6 +1290,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            self._host_prep_early_release()
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -1565,13 +1577,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        with self._sampler_tail_ctx():
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
 
         if self.speculator is not None:
             assert self.sampler is not None

@@ -142,6 +142,15 @@ class LaneModelRunner(GPUModelRunner):
         # __code__ swap per forward) must be OFF, and wrapper.py pins the
         # process-global dynamo knobs once instead of per call.
         self._compile_both = os.environ.get("HB_P2_COMPILE_BOTH") == "1"
+        # S9c-P1: sampling runs lock-free; only the shared tail
+        # (postprocess_sampled) and a buffer fence take the lock.
+        self._sample_narrow = os.environ.get("HB_P2_SAMPLE_NARROW") == "1"
+        # S9c-P2: release the lock right after the input batch is built;
+        # attention build + forward read only captured refs / per-lane or
+        # row-disjoint state (see notes/s9c design, hazard table).
+        self._prep_early_release = (
+            os.environ.get("HB_P2_PREP_EARLY_RELEASE") == "1"
+        )
         if self._compile_both:
             import vllm.envs as envs_mod
             if envs_mod.VLLM_USE_BYTECODE_HOOK:
@@ -227,6 +236,64 @@ class LaneModelRunner(GPUModelRunner):
         lane = getattr(self._tl, "lane", None)
         return self.lane_contexts.get(lane) if lane is not None else None
 
+    # S9c-P1: the sampling path's stream/state funnel attrs are routed to the
+    # calling lane's context instead of swapped under the lock (same shape as
+    # the S8 builder selection). Off-lane accesses (init, warmup, profiling)
+    # fall through to the instance slots.
+
+    @property
+    def main_stream(self):
+        ctx = self._tl_context() if hasattr(self, "_tl") else None
+        if ctx is not None and ctx.main_stream is not None:
+            return ctx.main_stream
+        return self.__dict__.get("main_stream")
+
+    @main_stream.setter
+    def main_stream(self, value):
+        ctx = self._tl_context() if hasattr(self, "_tl") else None
+        if ctx is not None:
+            ctx.main_stream = value
+        else:
+            self.__dict__["main_stream"] = value
+
+    @property
+    def output_copy_stream(self):
+        ctx = self._tl_context() if hasattr(self, "_tl") else None
+        if ctx is not None and ctx.copy_stream is not None:
+            return ctx.copy_stream
+        return self.__dict__.get("output_copy_stream")
+
+    @output_copy_stream.setter
+    def output_copy_stream(self, value):
+        ctx = self._tl_context() if hasattr(self, "_tl") else None
+        if ctx is not None:
+            ctx.copy_stream = value
+        else:
+            self.__dict__["output_copy_stream"] = value
+
+    @property
+    def execute_model_state(self):
+        ctx = self._tl_context() if hasattr(self, "_tl") else None
+        if ctx is not None:
+            return ctx.execute_model_state
+        return self.__dict__.get("execute_model_state")
+
+    @execute_model_state.setter
+    def execute_model_state(self, value):
+        ctx = self._tl_context() if hasattr(self, "_tl") else None
+        if ctx is not None:
+            ctx.execute_model_state = value
+        else:
+            self.__dict__["execute_model_state"] = value
+
+    def _sampler_tail_ctx(self):
+        # Narrow mode: postprocess_sampled mutates shared sampler state and
+        # request rows -- the one part of sampling that still needs the lock.
+        # Whole-body mode already holds it (non-reentrant): nullcontext.
+        if self._sample_narrow and self._tl_context() is not None:
+            return self._gen_state_lock
+        return nullcontext()
+
     def _lane_force_eager(self) -> bool:
         return (
             self._graphs_only
@@ -256,6 +323,7 @@ class LaneModelRunner(GPUModelRunner):
     def _host_prep_lock_acquire(self) -> None:
         self._gen_state_lock.acquire()
         self._tl.lock_held = True
+        self._tl.fence_owed = True
         context = self._tl_context()
         if context is not None:
             # Redirect the prepare path onto this lane's buffers. Safe: only
@@ -306,10 +374,30 @@ class LaneModelRunner(GPUModelRunner):
                     assert w0.data_ptr() != w1.data_ptr(), (
                         "S8 violation: shared float workspace")
 
+    def _host_prep_early_release(self) -> None:
+        # S9c-P2. Runs under the lock: restore the FA3 flags and the shared
+        # input_buffers pointer BEFORE releasing (the other lane may acquire
+        # immediately and install its own buffers -- a post-release swap-back
+        # would clobber it). The staged-buffer fence stays owed to the
+        # pre-forward seam: it must record after ALL consumer enqueues.
+        if not self._prep_early_release:
+            return
+        if not getattr(self._tl, "lock_held", False):
+            return
+        for builder in getattr(self._tl, "fa3_flipped", ()):
+            builder.use_full_cuda_graph = True
+        self._tl.fa3_flipped = ()
+        if self._tl_context() is not None:
+            self.input_buffers = self.lane_contexts[LANE_DECODE].input_buffers
+        self._tl.lock_held = False
+        self._gen_state_lock.release()
+
     def _host_prep_lock_release(self) -> None:
         # Idempotent: called at the pre-forward seam on the happy path and
         # from execute_model's finally for early returns and exceptions.
-        if not getattr(self._tl, "lock_held", False):
+        held = getattr(self._tl, "lock_held", False)
+        fence_owed = getattr(self._tl, "fence_owed", False)
+        if not held and not fence_owed:
             return
         try:
             for builder in getattr(self._tl, "fa3_flipped", ()):
@@ -319,12 +407,15 @@ class LaneModelRunner(GPUModelRunner):
                 # Every staged-transport consumer for this ticket is enqueued
                 # on the current (lane) stream; arm buffer-reuse events.
                 fence_uva_pools(torch.cuda.current_stream(self.device))
-                self.input_buffers = self.lane_contexts[
-                    LANE_DECODE
-                ].input_buffers
+                if held:
+                    self.input_buffers = self.lane_contexts[
+                        LANE_DECODE
+                    ].input_buffers
         finally:
-            self._tl.lock_held = False
-            self._gen_state_lock.release()
+            self._tl.fence_owed = False
+            if held:
+                self._tl.lock_held = False
+                self._gen_state_lock.release()
 
     def _stash_execute_state(self, state, dummy_run: bool = False) -> None:
         context = self._tl_context()
@@ -356,32 +447,28 @@ class LaneModelRunner(GPUModelRunner):
         context = self._tl_context()
         if context is None:
             return super().sample_tokens(grammar_output)
-        # Whole-body lock: sampling reads shared sampler tables and its
-        # post_update mutates them.
-        with self._gen_state_lock:
-            prev_main = self.__dict__.get("main_stream")
-            prev_copy = self.output_copy_stream
-            if context.main_stream is not None:
-                self.__dict__["main_stream"] = context.main_stream
-                torch.cuda.current_stream(self.device).wait_event(
-                    context.completion_event
-                )
-            if context.copy_stream is not None:
-                self.output_copy_stream = context.copy_stream
-            self.execute_model_state = context.execute_model_state
-            context.execute_model_state = None
-            try:
-                result = super().sample_tokens(grammar_output)
-            finally:
-                if prev_main is not None:
-                    self.__dict__["main_stream"] = prev_main
-                self.output_copy_stream = prev_copy
-            # Re-record so controller readiness queries cover the full
-            # ticket (forward + sampling + postprocess).
-            context.completion_event.record(
-                torch.cuda.current_stream(self.device)
+        if context.main_stream is not None:
+            # Order this thread's sampling stream behind the lane's forward.
+            torch.cuda.current_stream(self.device).wait_event(
+                context.completion_event
             )
-            return result
+        if self._sample_narrow:
+            # S9c-P1: lock-free body (streams/state routed per-lane by the
+            # properties; postprocess takes the short tail lock in-base),
+            # then fence sampling's staged-buffer consumers under the lock
+            # so ring-slot rewrites keep waiting on them ([H2]).
+            result = super().sample_tokens(grammar_output)
+            with self._gen_state_lock:
+                fence_uva_pools(torch.cuda.current_stream(self.device))
+        else:
+            with self._gen_state_lock:
+                result = super().sample_tokens(grammar_output)
+        # Re-record so controller readiness queries cover the full
+        # ticket (forward + sampling + postprocess).
+        context.completion_event.record(
+            torch.cuda.current_stream(self.device)
+        )
+        return result
 
     def prepare_attn(self, input_batch: InputBatch):
         context = self._tl_context()
