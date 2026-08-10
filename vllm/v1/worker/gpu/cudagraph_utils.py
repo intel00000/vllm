@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -37,6 +38,32 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+# HB_P2_CAPTURE_STREAM_PRIORITY=<int>: capture FULL graphs on a stream of
+# that priority. torch bakes per-node kernel priorities from the CAPTURE
+# stream (never the launch stream), so replays dispatch ahead of queued
+# default-priority work. Under HB_P2_DECODE_GRAPHS_ONLY the FULL set is the
+# decode lane, making this a decode-only lever. 0 (default) = stock capture.
+_CAPTURE_STREAM_PRIORITY = int(
+    os.environ.get("HB_P2_CAPTURE_STREAM_PRIORITY", "0") or "0"
+)
+_capture_stream: torch.cuda.Stream | None = None
+
+
+def _priority_capture_stream() -> torch.cuda.Stream | None:
+    global _capture_stream
+    if not _CAPTURE_STREAM_PRIORITY:
+        return None
+    if _capture_stream is None:
+        _capture_stream = torch.cuda.Stream(
+            priority=_CAPTURE_STREAM_PRIORITY
+        )
+        logger.info(
+            "Capturing FULL cudagraphs on priority %d stream (requested %d)",
+            _capture_stream.priority,
+            _CAPTURE_STREAM_PRIORITY,
+        )
+    return _capture_stream
 
 
 class AttentionState(NamedTuple):
@@ -346,7 +373,9 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
-                        with torch.cuda.graph(graph, self.pool):
+                        with torch.cuda.graph(
+                            graph, self.pool, stream=_priority_capture_stream()
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
