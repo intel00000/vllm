@@ -357,11 +357,18 @@ class DualModelRunner:
         # Gen-side cap: applies to the WHOLE gen model (prefill + decode share
         # forwards in this runner; decode is SM-insensitive on Hopper).
         gen_cublas_sm_target = _env_int("VLLM_GEN_CUBLAS_SM_TARGET")
+        # Prefill-only cap: lets the dense prefill thread carry a target
+        # while decode's thread (where FULL graphs capture) stays uncapped.
+        # Unset -> inherit the gen-wide value (previous behavior).
+        prefill_cublas_sm_target = (
+            _env_int("VLLM_PREFILL_CUBLAS_SM_TARGET") or gen_cublas_sm_target
+        )
         # sm-lever-sweep: self-labeling NVTX tag for the active levers.
         self._lever_tag = (
             f"cublas={os.environ.get('VLLM_EMBED_CUBLAS_SM_TARGET', 'off')},"
             f"fa={os.environ.get('VLLM_FA_SM_MARGIN', 'off')},"
             f"gcublas={os.environ.get('VLLM_GEN_CUBLAS_SM_TARGET', 'off')},"
+            f"pcublas={os.environ.get('VLLM_PREFILL_CUBLAS_SM_TARGET', 'off')},"
             f"gfa={os.environ.get('VLLM_GEN_FA_SM_MARGIN', 'off')},"
             f"ws={os.environ.get('VLLM_WORK_STREAM_BACKEND', 'none')}"
         )
@@ -387,11 +394,11 @@ class DualModelRunner:
             self.dense_stream = embed_ws.stream
             self._warm_role_thread(
                 self._prefill_executor, embed_ws, self.device,
-                sm_target=gen_cublas_sm_target)
+                sm_target=prefill_cublas_sm_target)
             if embed_ws.full_fallback is not None:
                 self._warm_role_thread(
                     self._prefill_executor, embed_ws.full_fallback, self.device,
-                    sm_target=gen_cublas_sm_target)
+                    sm_target=prefill_cublas_sm_target)
 
     def _select_active_ws(self, has_decode_work: bool, has_embed_work: bool) -> None:
         """Pick each role's WorkStream for this step: the partitioned ws only
