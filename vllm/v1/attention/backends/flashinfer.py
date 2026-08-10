@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -88,6 +89,8 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+_DUAL_LANES = os.environ.get("VLLM_DUAL_LANES") == "1"
 
 trtllm_workspace_buffer = None
 
@@ -1229,7 +1232,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
         # (block_tables, seq_lens) directly.
         needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
+        if needs_seq_lens_cpu:
+            # S9c-P0: the seq_lens_cpu property is a BLOCKING .to("cpu") that
+            # drains the calling stream -- under lanes this build runs inside
+            # the gen_state_lock, so a prefill-lane build would hold the lock
+            # for its whole prior forward's drain and starve decode. The
+            # upper bound is exact for every row outside async spec decode,
+            # which lanes mode excludes (spec decode is rejected at lane
+            # init), so use it there and keep the drain on the stock path.
+            ub = common_attn_metadata.seq_lens_cpu_upper_bound
+            if _DUAL_LANES and ub is not None:
+                seq_lens_cpu = ub
+            else:
+                seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        else:
+            seq_lens_cpu = None
         seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
         num_blocks_np = (
             (seq_lens_np + (page_size - 1)) // page_size
