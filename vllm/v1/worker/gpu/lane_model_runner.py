@@ -93,6 +93,9 @@ class LaneContext:
     execute_model_state: object | None = None
     # Prefill-only private forward tensors; built after initialize_kv_cache.
     attn_scratch: LaneAttentionScratch | None = None
+    # HB_P2_PREP_STREAM: dedicated stream for the ticket-head prep window
+    # (staged-write scatters through input/attention preparation).
+    prep_stream: torch.cuda.Stream | None = None
 
 
 class LaneModelRunner(GPUModelRunner):
@@ -212,6 +215,25 @@ class LaneModelRunner(GPUModelRunner):
                 copy_event=torch.cuda.Event(),
             ),
         }
+        # HB_P2_PREP_STREAM=1 (slackserve port, Theo d8224a4a5/52a25c079):
+        # enqueue the ticket-head prep window -- staged-write scatters
+        # through input/attention preparation -- on a dedicated PER-LANE
+        # prep stream, and make the lane's execution stream wait on a
+        # prep-done event before the forward. Prep kernels then never queue
+        # behind a busy execution stream: the staged-buffer fence events
+        # (fence_uva_pools) complete promptly, so one lane's ticket head no
+        # longer serializes behind the other lane's in-flight forward. The
+        # stream must be per lane: prep-time allocations (attention
+        # metadata) free into the allocating stream's pool as soon as host
+        # refs drop, and a shared prep stream would let one lane's next
+        # prep reuse memory the other lane's forward is still reading.
+        # Same-lane reuse is safe: the controller keeps one in-flight
+        # ticket per lane and host-resolves its output (D2H copy event)
+        # before dispatching the lane's next ticket.
+        self._prep_stream_enabled = os.environ.get("HB_P2_PREP_STREAM") == "1"
+        if self._prep_stream_enabled:
+            for lane_context in self.lane_contexts.values():
+                lane_context.prep_stream = torch.cuda.Stream(self.device)
         # Serializes the shared-host state-update + prep phase across lanes
         # (base execute_model calls the acquire/release seams); re-taken for
         # sample_tokens' shared-mutation tail. Recreates the single-host-
@@ -320,6 +342,29 @@ class LaneModelRunner(GPUModelRunner):
                     builders[id(builder)] = builder
         return list(builders.values())
 
+    def _begin_prep(self, context: LaneContext) -> None:
+        # HB_P2_PREP_STREAM: run this ticket's prep window on the lane's
+        # prep stream. _end_prep (called from the pre-forward
+        # _host_prep_lock_release, after the staged-buffer fence) records a
+        # prep-done event and restores the execution stream, which then
+        # waits on that event. Never used for dummy runs: capture/warmup/
+        # profiling must see stock stream semantics.
+        assert context.prep_stream is not None
+        self._tl.prep_exec_stream = torch.cuda.current_stream(self.device)
+        torch.cuda.set_stream(context.prep_stream)
+
+    def _end_prep(self) -> None:
+        """Return to the lane's execution stream, ordered after this prep."""
+        exec_stream = getattr(self._tl, "prep_exec_stream", None)
+        if exec_stream is None:
+            return
+        self._tl.prep_exec_stream = None
+        context = self._tl_context()
+        assert context is not None
+        context.prep_event.record(torch.cuda.current_stream(self.device))
+        torch.cuda.set_stream(exec_stream)
+        exec_stream.wait_event(context.prep_event)
+
     def _host_prep_lock_acquire(self) -> None:
         self._gen_state_lock.acquire()
         self._tl.lock_held = True
@@ -407,6 +452,11 @@ class LaneModelRunner(GPUModelRunner):
                 # Every staged-transport consumer for this ticket is enqueued
                 # on the current (lane) stream; arm buffer-reuse events.
                 fence_uva_pools(torch.cuda.current_stream(self.device))
+                # HB_P2_PREP_STREAM: prep is fully enqueued and fenced on
+                # the prep stream; hand the ticket back to the execution
+                # stream (records the prep-done event it waits on). No-op
+                # when the feature is off or prep never began (dummy runs).
+                self._end_prep()
                 if held:
                     self.input_buffers = self.lane_contexts[
                         LANE_DECODE
@@ -432,6 +482,13 @@ class LaneModelRunner(GPUModelRunner):
         lane = self.lane_for(scheduler_output)
         context = self.lane_contexts[lane]
         self._tl.lane = lane
+        # Base signature: (scheduler_output, intermediate_tensors=None,
+        # dummy_run=False, ...).
+        dummy_run = kwargs.get(
+            "dummy_run", args[1] if len(args) > 1 else False
+        )
+        if self._prep_stream_enabled and not dummy_run:
+            self._begin_prep(context)
         margin = self.fa_sm_margin.get(lane, 0)
         margin_ctx = lane_sm_margin(margin) if margin > 0 else nullcontext()
         try:
@@ -439,6 +496,11 @@ class LaneModelRunner(GPUModelRunner):
                 result = super().execute_model(scheduler_output, *args, **kwargs)
         finally:
             self._host_prep_lock_release()
+            # Safety net for exits that bypass the pre-forward seam (an
+            # exception before the lock acquire): never leave this thread
+            # on the prep stream. Idempotent -- the seam already cleared it
+            # on the happy path and on locked early returns.
+            self._end_prep()
         context.main_stream = torch.cuda.current_stream(self.device)
         context.completion_event.record(context.main_stream)
         return result
