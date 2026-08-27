@@ -39,17 +39,31 @@ LANE_PREFILL = "prefill"
 GEN_LANES = (LANE_DECODE, LANE_PREFILL)
 
 
+def rebind_custom_ops_to_cuda(model: torch.nn.Module, spec: str) -> list[str]:
+    """Rebind the CustomOp instances named in ``spec`` to forward_cuda."""
+    from vllm.model_executor.custom_op import CustomOp
+
+    names = {s.strip().lstrip("+") for s in spec.split(",") if s.strip()}
+    rebound: list[str] = []
+    for module in model.modules():
+        if isinstance(module, CustomOp) and getattr(module, "name", None) in names:
+            module._forward_method = module.forward_cuda
+            rebound.append(type(module).__name__)
+    if not rebound:
+        raise RuntimeError(
+            f"HB_P2_PREFILL_CUSTOM_OPS matched no modules: {sorted(names)}"
+        )
+    return rebound
+
+
 class LaneAttentionScratch:
-    """Private forward block-tables + slot-mappings for a non-decode lane.
-    """
+    """Private forward block-tables + slot-mappings for a non-decode lane."""
 
     def __init__(self, logical: BlockTables):
         self.input_block_tables = [
             torch.zeros_like(table.gpu) for table in logical.block_tables
         ]
-        self.input_block_table_ptrs = logical._make_ptr_tensor(
-            self.input_block_tables
-        )
+        self.input_block_table_ptrs = logical._make_ptr_tensor(self.input_block_tables)
         self.slot_mappings = torch.zeros(
             logical.num_kv_cache_groups,
             logical.max_num_batched_tokens,
@@ -151,11 +165,10 @@ class LaneModelRunner(GPUModelRunner):
         # S9c-P2: release the lock right after the input batch is built;
         # attention build + forward read only captured refs / per-lane or
         # row-disjoint state (see notes/s9c design, hazard table).
-        self._prep_early_release = (
-            os.environ.get("HB_P2_PREP_EARLY_RELEASE") == "1"
-        )
+        self._prep_early_release = os.environ.get("HB_P2_PREP_EARLY_RELEASE") == "1"
         if self._compile_both:
             import vllm.envs as envs_mod
+
             if envs_mod.VLLM_USE_BYTECODE_HOOK:
                 raise ValueError(
                     "HB_P2_COMPILE_BOTH requires VLLM_USE_BYTECODE_HOOK=0 "
@@ -175,6 +188,19 @@ class LaneModelRunner(GPUModelRunner):
         if self._compile_decode and not self._graphs_only:
             raise ValueError(
                 "HB_P2_COMPILE_DECODE requires HB_P2_DECODE_GRAPHS_ONLY=1."
+            )
+        self._prefill_custom_ops = os.environ.get("HB_P2_PREFILL_CUSTOM_OPS", "")
+        if self._prefill_custom_ops and self._compile_both:
+            raise ValueError(
+                "HB_P2_PREFILL_CUSTOM_OPS has no reachable dispatch path "
+                "under HB_P2_COMPILE_BOTH=1: the prefill lane executes the "
+                "compiled artifact, whose custom-op choices were baked in at "
+                "trace time (inductor-fused under custom_ops 'none', opaque "
+                "torch.ops._C calls when enabled) -- the CustomOp instances' "
+                "_forward_method is never consulted by compiled code, so the "
+                "rebind would silently change nothing. Use "
+                "HB_P2_COMPILE_DECODE=1 (skip-compiled eager prefill) or an "
+                "uncompiled-lanes config."
             )
         cg_mode = vllm_config.compilation_config.cudagraph_mode
         if (
@@ -244,9 +270,7 @@ class LaneModelRunner(GPUModelRunner):
         self._tl = threading.local()
         self.fa_sm_margin = {
             LANE_DECODE: int(os.environ.get("HB_P2_FA_SM_MARGIN_DECODE", "0") or 0),
-            LANE_PREFILL: int(
-                os.environ.get("HB_P2_FA_SM_MARGIN_PREFILL", "0") or 0
-            ),
+            LANE_PREFILL: int(os.environ.get("HB_P2_FA_SM_MARGIN_PREFILL", "0") or 0),
         }
         logger.info(
             "LaneModelRunner: %s lanes (decode = base buffers, prefill = "
@@ -317,10 +341,7 @@ class LaneModelRunner(GPUModelRunner):
         return nullcontext()
 
     def _lane_force_eager(self) -> bool:
-        return (
-            self._graphs_only
-            and getattr(self._tl, "lane", None) == LANE_PREFILL
-        )
+        return self._graphs_only and getattr(self._tl, "lane", None) == LANE_PREFILL
 
     def _lane_skip_compiled(self) -> bool:
         # S9a: under COMPILE_BOTH the prefill lane enters the compiled
@@ -328,10 +349,50 @@ class LaneModelRunner(GPUModelRunner):
         # keeps its cudagraph_runtime_mode NONE).
         if self._compile_both:
             return False
-        return (
-            self._compile_decode
-            and getattr(self._tl, "lane", None) == LANE_PREFILL
+        return self._compile_decode and getattr(self._tl, "lane", None) == LANE_PREFILL
+
+    def _apply_prefill_custom_ops(self) -> None:
+        """HB_P2_PREFILL_CUSTOM_OPS: post-capture per-lane custom-op rebind.
+
+        Intended use: serve with the listed ops fused (custom_ops
+        ``["none"]``) so decode's FULL graphs are frozen over the
+        inductor-fused stock kernels at capture time, then rebind the
+        listed CustomOp instances of the gen model to forward_cuda. The
+        rebind swaps the instance-level ``_forward_method``, which only
+        EAGER module calls consult; compiled code baked its op choices in
+        at trace time. Reachable dispatch paths after capture, per mode:
+
+        - HB_P2_COMPILE_DECODE=1: the prefill lane bypasses the compiled
+          callable (_lane_skip_compiled -> forward_context.skip_compiled ->
+          original Python forward), so ONLY prefill picks up the custom
+          kernels; decode keeps entering the compiled artifact (uncaptured
+          sizes) or replaying its graphs. This is the intended mode --
+          Theo's eager-prefill regime, translated.
+        - graphs-only without compilation: both lanes' Python forwards are
+          eager; decode normally replays FULL graphs, but a non-graph
+          decode fallback would see the rebound ops too. (With
+          CompilationMode NONE custom ops default to enabled anyway, so
+          the rebind is normally a no-op in this mode.)
+        - HB_P2_COMPILE_BOTH=1: NOT reachable for the compiled prefill --
+          __init__ rejects the combination instead of silently changing
+          nothing.
+        """
+        spec = self._prefill_custom_ops
+        if not spec:
+            return
+        rebound = rebind_custom_ops_to_cuda(self.model, spec)
+        logger.info(
+            "HB_P2_PREFILL_CUSTOM_OPS: rebound %d modules to forward_cuda "
+            "(%s); decode's captured graphs and compiled-artifact entries "
+            "keep their capture-time kernels",
+            len(rebound),
+            sorted(set(rebound)),
         )
+
+    def capture_model(self) -> int:
+        captured = super().capture_model()
+        self._apply_prefill_custom_ops()
+        return captured
 
     def _fa3_builders(self):
         builders = {}
@@ -407,17 +468,23 @@ class LaneModelRunner(GPUModelRunner):
                 if len(group.metadata_builders) < 2:
                     continue
                 b0, b1 = group.metadata_builders[0], group.metadata_builders[1]
-                for attr in ("paged_kv_indptr", "paged_kv_indices",
-                             "paged_kv_last_page_len"):
+                for attr in (
+                    "paged_kv_indptr",
+                    "paged_kv_indices",
+                    "paged_kv_last_page_len",
+                ):
                     t0, t1 = getattr(b0, attr, None), getattr(b1, attr, None)
                     if t0 is not None and t1 is not None:
                         assert t0.gpu.data_ptr() != t1.gpu.data_ptr(), (
-                            "S8 violation: shared builder buffer", attr)
+                            "S8 violation: shared builder buffer",
+                            attr,
+                        )
                 w0 = getattr(b0, "_workspace_buffer", None)
                 w1 = getattr(b1, "_workspace_buffer", None)
                 if w0 is not None and w1 is not None:
                     assert w0.data_ptr() != w1.data_ptr(), (
-                        "S8 violation: shared float workspace")
+                        "S8 violation: shared float workspace"
+                    )
 
     def _host_prep_early_release(self) -> None:
         # S9c-P2. Runs under the lock: restore the FA3 flags and the shared
@@ -458,9 +525,7 @@ class LaneModelRunner(GPUModelRunner):
                 # when the feature is off or prep never began (dummy runs).
                 self._end_prep()
                 if held:
-                    self.input_buffers = self.lane_contexts[
-                        LANE_DECODE
-                    ].input_buffers
+                    self.input_buffers = self.lane_contexts[LANE_DECODE].input_buffers
         finally:
             self._tl.fence_owed = False
             if held:
@@ -484,9 +549,7 @@ class LaneModelRunner(GPUModelRunner):
         self._tl.lane = lane
         # Base signature: (scheduler_output, intermediate_tensors=None,
         # dummy_run=False, ...).
-        dummy_run = kwargs.get(
-            "dummy_run", args[1] if len(args) > 1 else False
-        )
+        dummy_run = kwargs.get("dummy_run", args[1] if len(args) > 1 else False)
         if self._prep_stream_enabled and not dummy_run:
             self._begin_prep(context)
         margin = self.fa_sm_margin.get(lane, 0)
@@ -511,9 +574,7 @@ class LaneModelRunner(GPUModelRunner):
             return super().sample_tokens(grammar_output)
         if context.main_stream is not None:
             # Order this thread's sampling stream behind the lane's forward.
-            torch.cuda.current_stream(self.device).wait_event(
-                context.completion_event
-            )
+            torch.cuda.current_stream(self.device).wait_event(context.completion_event)
         if self._sample_narrow:
             # S9c-P1: lock-free body (streams/state routed per-lane by the
             # properties; postprocess takes the short tail lock in-base),
@@ -527,9 +588,7 @@ class LaneModelRunner(GPUModelRunner):
                 result = super().sample_tokens(grammar_output)
         # Re-record so controller readiness queries cover the full
         # ticket (forward + sampling + postprocess).
-        context.completion_event.record(
-            torch.cuda.current_stream(self.device)
-        )
+        context.completion_event.record(torch.cuda.current_stream(self.device))
         return result
 
     def prepare_attn(self, input_batch: InputBatch):
