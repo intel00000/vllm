@@ -747,9 +747,15 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    safe_victims = self.lane_safe_preemption_victims()
+                    if not safe_victims:
+                        self._log_decision(
+                            request.request_id, "DEFER_PREEMPT_ALL_INFLIGHT"
+                        )
+                        break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            safe_victims,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
@@ -772,7 +778,8 @@ class Scheduler(SchedulerInterface):
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = safe_victims[-1]
+                        self.running.remove(preempted_req)
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -859,8 +866,8 @@ class Scheduler(SchedulerInterface):
             # the gate sees an accurate count within the same step
             # (matters for the wave_size cap).
             if _dual_cfg is not None and _dual_cfg.wave_batching:
-                _wave_gen_pf, _wave_embed_pf = (
-                    Scheduler._compute_in_prefill_sets(self.running, _dual_cfg)
+                _wave_gen_pf, _wave_embed_pf = Scheduler._compute_in_prefill_sets(
+                    self.running, _dual_cfg
                 )
             else:
                 _wave_gen_pf, _wave_embed_pf = set(), set()
@@ -946,9 +953,7 @@ class Scheduler(SchedulerInterface):
                         fresh_decode_prefill_admitted=step_admitted_FRESH_decode_prefill,
                         fresh_embed_prefill_admitted=step_admitted_FRESH_embed_prefill,
                     ):
-                        self._log_decision(
-                            request_id, "DEFER_NO_DOUBLE_PREFILL"
-                        )
+                        self._log_decision(request_id, "DEFER_NO_DOUBLE_PREFILL")
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
@@ -2019,6 +2024,16 @@ class Scheduler(SchedulerInterface):
     def release_lane_inflight(self, req_ids: Iterable[str]) -> None:
         self._lane_inflight_req_ids.difference_update(req_ids)
 
+    def lane_safe_preemption_victims(self) -> list[Request]:
+        """Running requests not owned by a dispatched-unresolved lane ticket."""
+        if not self._lane_inflight_req_ids:
+            return self.running
+        return [
+            request
+            for request in self.running
+            if request.request_id not in self._lane_inflight_req_ids
+        ]
+
     def has_lane_work(self, lane: str) -> bool:
         """Cheap dispatchability probe for the lane controller.
 
@@ -2597,9 +2612,7 @@ class Scheduler(SchedulerInterface):
         return kv_usage >= dual_cfg.kv_pressure_skip_threshold
 
     @staticmethod
-    def _bucket_for_request(
-        dual_cfg: DualModelConfig | None, request: Request
-    ) -> str:
+    def _bucket_for_request(dual_cfg: DualModelConfig | None, request: Request) -> str:
         """Classify a request into one of {decode_prefill, decode_loop,
         embed_prefill} for per-bucket EPT budget accounting.
 
@@ -2612,10 +2625,7 @@ class Scheduler(SchedulerInterface):
         When dual_cfg is None, every request is "decode_loop" or
         "decode_prefill" -- no embed bucket exists.
         """
-        if (
-            dual_cfg is not None
-            and request.model_id == dual_cfg.embed_model_id
-        ):
+        if dual_cfg is not None and request.model_id == dual_cfg.embed_model_id:
             return "embed_prefill"
         return "decode_loop" if request.num_output_tokens > 0 else "decode_prefill"
 
@@ -2724,10 +2734,7 @@ class Scheduler(SchedulerInterface):
         # request_bucket == "decode_prefill"
         if embed_in_prefill:
             return "DEFER_WAVE_EMBED_PREFILL_ACTIVE"
-        if (
-            dual_cfg.wave_size is not None
-            and len(gen_in_prefill) >= dual_cfg.wave_size
-        ):
+        if dual_cfg.wave_size is not None and len(gen_in_prefill) >= dual_cfg.wave_size:
             return "DEFER_WAVE_SIZE_CAP"
         return None
 
@@ -2772,9 +2779,7 @@ class Scheduler(SchedulerInterface):
 
         return False
 
-    def _is_embed_gate_blocked_without_state_change(
-        self, request: Request
-    ) -> bool:
+    def _is_embed_gate_blocked_without_state_change(self, request: Request) -> bool:
         """Mirror of _should_skip_embed_waiting_request without flag mutation.
 
         Used by _select_waiting_queue_for_scheduling to decide whether
@@ -2832,9 +2837,7 @@ class Scheduler(SchedulerInterface):
     # is what flush groups by.
     # ------------------------------------------------------------------
 
-    def _log_decision(
-        self, req_id: str, reason: str, num_tokens: int = 0
-    ) -> None:
+    def _log_decision(self, req_id: str, reason: str, num_tokens: int = 0) -> None:
         if self._decision_log_enabled:
             self._decisions.append((req_id, reason, num_tokens))
 
@@ -2887,9 +2890,7 @@ class Scheduler(SchedulerInterface):
             "embed": agg["embed"],
         }
 
-    def _flush_decision_log(
-        self, *, budget_remaining: int, budget_total: int
-    ) -> None:
+    def _flush_decision_log(self, *, budget_remaining: int, budget_total: int) -> None:
         if self._decision_log_level == 0:
             return
 
@@ -2904,11 +2905,21 @@ class Scheduler(SchedulerInterface):
                 "[sched step=%d kv=%.1f%% used=%d owned=%d free=%d/%d bs=%d] "
                 "decode n=%d blocks=%d (max %d ~%dtok)  "
                 "embed n=%d blocks=%d (max %d ~%dtok)",
-                self._decision_step, 100 * kv["usage"],
-                kv["used_blocks"], kv["owned_blocks"],
-                kv["free_blocks"], kv["total_blocks"], bs,
-                d[0], d[1], d[2], d[2] * bs,
-                e[0], e[1], e[2], e[2] * bs,
+                self._decision_step,
+                100 * kv["usage"],
+                kv["used_blocks"],
+                kv["owned_blocks"],
+                kv["free_blocks"],
+                kv["total_blocks"],
+                bs,
+                d[0],
+                d[1],
+                d[2],
+                d[2] * bs,
+                e[0],
+                e[1],
+                e[2],
+                e[2] * bs,
             )
 
         # Bucket entries by verb (ADMIT/DEFER/SKIP/PREEMPTED) AND by full
@@ -3173,9 +3184,7 @@ class Scheduler(SchedulerInterface):
                     request.request_id
                 )
                 self.requests[request.request_id] = request
-                self._log_decision(
-                    request.request_id, "GATED_PARENT_PENDING"
-                )
+                self._log_decision(request.request_id, "GATED_PARENT_PENDING")
             else:
                 self._enqueue_waiting_request(request)
                 self.requests[request.request_id] = request
