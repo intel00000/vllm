@@ -150,6 +150,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_model_len = self.model_config.max_model_len
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
+        if os.environ.get("VLLM_DUAL_LANES") == "1":
+            # Lanes: admissions ride prefill tickets while releases ride
+            # decode tickets, so the worker transiently tracks up to the
+            # scheduler's running set PLUS a full set of finished-but-
+            # unreleased requests. 2x is the worst-case bound (crash
+            # "No free indices" at tech-scale backlog on slow hosts).
+            self.max_num_reqs *= 2
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
