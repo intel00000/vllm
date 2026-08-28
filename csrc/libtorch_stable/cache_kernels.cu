@@ -1,5 +1,6 @@
 #include "torch_utils.h"
 #include "dispatch_utils.h"
+#include "hb_grid_budget.cuh"
 
 #include "../cuda_utils.h"
 #include "../cuda_compat.h"
@@ -322,13 +323,16 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
     const int block_size, const float* k_scale, const float* v_scale,
-    const int kv_scale_stride) {
-  const int64_t token_idx = blockIdx.x;
-  const int64_t slot_idx = slot_mapping[token_idx];
-  // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
-    return;
-  }
+    const int kv_scale_stride, const int64_t num_tokens) {
+  // HB S2b: grid-stride token loop (CTA budget; full grid == stock).
+  for (int64_t token_idx = blockIdx.x; token_idx < num_tokens;
+       token_idx += gridDim.x) {
+    const int64_t slot_idx = slot_mapping[token_idx];
+    // NOTE: slot_idx can be -1 if the token is padded (skip, don't return:
+    // this CTA may own later tokens under the budget)
+    if (slot_idx < 0) {
+      continue;
+    }
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const int n_elems = num_heads * head_size;
@@ -397,6 +401,7 @@ __global__ void reshape_and_cache_flash_kernel(
                                          v_op);
     }
   }
+  }  // HB S2b token loop
 }
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
@@ -741,7 +746,7 @@ void reshape_and_cache(
           head_stride, key_stride, value_stride, num_heads, head_size,       \
           block_size, reinterpret_cast<const float*>(k_scale.data_ptr()),    \
           reinterpret_cast<const float*>(v_scale.data_ptr()),                \
-          kv_scale_stride);
+          kv_scale_stride, num_tokens);
 
 void reshape_and_cache_flash(
     torch::stable::Tensor& key,    // [num_tokens, num_heads, head_size]
@@ -807,7 +812,9 @@ void reshape_and_cache_flash(
                   "k_scale and v_scale must be of shape [1] or [num_heads]");
   int kv_scale_stride = (k_scale.numel() > 1) ? 1 : 0;
 
-  dim3 grid(num_tokens);
+  // HB S2b: env-gated CTA budget (decode's ~batch-CTA launches pass under
+  // any sane cap; the 16k-CTA prefill-chunk launches get capped).
+  dim3 grid(vllm::hb_bounded_grid(num_tokens));
   dim3 block(std::min(num_heads * head_size, 512));
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
