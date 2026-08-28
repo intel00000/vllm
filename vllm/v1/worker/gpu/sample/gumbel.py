@@ -1,8 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+
+# S2b (kernel-control program): cap for the gumbel sweep's CTA ask. Stock
+# grid is (num_tokens, cdiv(V, 1024)) = ~38k CTAs at bs 256 / V 152k — the
+# widest eager launch on the decode stream. >0 switches to a 1D grid-stride
+# launch of at most this many CTAs (bit-identical output; RNG keys on
+# (req, pos), not on the launch geometry). Read once: eager-only kernel,
+# but keep the value stable for reproducibility.
+_HB_SAMPLE_CTA_BUDGET = int(os.environ.get("HB_VLLM_SAMPLE_CTA_BUDGET", "0") or 0)
 
 # Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
 # zero draws before the flipped Gumbel transform below.
@@ -212,6 +222,69 @@ def _gumbel_sample_kernel(
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
 
+@triton.jit
+def _gumbel_sample_kernel_capped(
+    local_argmax_ptr,
+    local_argmax_stride,
+    local_max_ptr,
+    local_max_stride,
+    processed_logits_ptr,
+    processed_logits_stride,
+    processed_logits_col_ptr,
+    logits_ptr,
+    logits_stride,
+    expanded_idx_mapping_ptr,
+    seeds_ptr,
+    pos_ptr,
+    temp_ptr,
+    vocab_size,
+    num_tokens,
+    num_blocks,
+    BLOCK_SIZE: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr,
+    USE_FP64: tl.constexpr,
+    PER_TOKEN_COL: tl.constexpr,
+):
+    # S2b bounded variant: 1D grid-stride over the (token, vocab-block) tile
+    # space; per-tile body identical to _gumbel_sample_kernel.
+    pid = tl.program_id(0)
+    total = num_tokens * num_blocks
+    for tile in range(pid, total, tl.num_programs(0)):
+        token_idx = (tile // num_blocks).to(tl.int64)
+        block_idx = tile % num_blocks
+        block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = block < vocab_size
+        logits = tl.load(
+            logits_ptr + token_idx * logits_stride + block,
+            mask=mask,
+            other=float("-inf"),
+        )
+        logits = logits.to(tl.float32)
+
+        value, idx = gumbel_block_argmax(
+            logits,
+            block,
+            mask,
+            token_idx,
+            expanded_idx_mapping_ptr,
+            temp_ptr,
+            seeds_ptr,
+            pos_ptr,
+            processed_logits_ptr,
+            processed_logits_stride,
+            processed_logits_col_ptr,
+            vocab_size,
+            APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+            USE_FP64=USE_FP64,
+            PER_TOKEN_COL=PER_TOKEN_COL,
+        )
+        token_id = block_idx * BLOCK_SIZE + idx
+        tl.store(
+            local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id
+        )
+        tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
+
+
 def gumbel_sample(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     expanded_idx_mapping: torch.Tensor,  # [num_tokens]
@@ -238,6 +311,34 @@ def gumbel_sample(
         output_processed_logits_col is not None
         and output_processed_logits_col.dim() > 0
     )
+    budget = _HB_SAMPLE_CTA_BUDGET
+    if budget > 0 and num_tokens * num_blocks > budget:
+        _gumbel_sample_kernel_capped[(budget,)](
+            local_argmax,
+            local_argmax.stride(0),
+            local_max,
+            local_max.stride(0),
+            output_processed_logits,
+            output_processed_logits.stride(0)
+            if output_processed_logits is not None
+            else 0,
+            output_processed_logits_col,
+            logits,
+            logits.stride(0),
+            expanded_idx_mapping,
+            seed,
+            pos,
+            temperature,
+            vocab_size,
+            num_tokens,
+            num_blocks,
+            BLOCK_SIZE=BLOCK_SIZE,
+            APPLY_TEMPERATURE=apply_temperature,
+            USE_FP64=use_fp64,
+            PER_TOKEN_COL=per_token_col,
+        )
+        max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+        return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
     _gumbel_sample_kernel[(num_tokens, num_blocks)](
         local_argmax,
         local_argmax.stride(0),

@@ -16,6 +16,7 @@ never touch the captured tensors (never call get_dummy_*).
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
 from contextlib import nullcontext
@@ -40,15 +41,41 @@ GEN_LANES = (LANE_DECODE, LANE_PREFILL)
 
 
 def rebind_custom_ops_to_cuda(model: torch.nn.Module, spec: str) -> list[str]:
-    """Rebind the CustomOp instances named in ``spec`` to forward_cuda."""
+    """Rebind the CustomOp instances named in ``spec`` to forward_cuda.
+
+    S2b additions: (a) 'rms_norm' is refused — the _C kernel runs the Qwen3
+    q/k head-norms as tokens*heads 16-thread rows, ~16x WIDER than the
+    inductor fusion (width-explosion trap); (b) with
+    HB_VLLM_ELTWISE_CTA_BUDGET > 0, 'silu_and_mul' rebinds to the
+    grid-stride BOUNDED kernel (hb_bounded_ops) instead of forward_cuda.
+    """
     from vllm.model_executor.custom_op import CustomOp
 
     names = {s.strip().lstrip("+") for s in spec.split(",") if s.strip()}
+    if "rms_norm" in names:
+        logger.warning(
+            "HB_P2_PREFILL_CUSTOM_OPS contains 'rms_norm'; refusing to rebind "
+            "it (the _C kernel widens Qwen3 q/k head-norms ~16x vs the "
+            "inductor fusion)."
+        )
+        names.discard("rms_norm")
+    eltwise_budget = int(os.environ.get("HB_VLLM_ELTWISE_CTA_BUDGET", "0") or 0)
+    bounded_silu = None
+    if eltwise_budget > 0 and "silu_and_mul" in names:
+        from vllm.v1.worker.gpu.hb_bounded_ops import bounded_silu_and_mul
+
+        bounded_silu = bounded_silu_and_mul
     rebound: list[str] = []
     for module in model.modules():
         if isinstance(module, CustomOp) and getattr(module, "name", None) in names:
-            module._forward_method = module.forward_cuda
-            rebound.append(type(module).__name__)
+            if bounded_silu is not None and module.name == "silu_and_mul":
+                module._forward_method = functools.partial(
+                    bounded_silu, cta_budget=eltwise_budget
+                )
+                rebound.append(f"{type(module).__name__}:bounded{eltwise_budget}")
+            else:
+                module._forward_method = module.forward_cuda
+                rebound.append(type(module).__name__)
     if not rebound:
         raise RuntimeError(
             f"HB_P2_PREFILL_CUSTOM_OPS matched no modules: {sorted(names)}"
