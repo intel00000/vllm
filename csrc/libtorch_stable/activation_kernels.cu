@@ -222,10 +222,14 @@ inline void hb_launch_act_and_mul(scalar_t* out, const scalar_t* input,
                                   cudaStream_t stream) {
   const int64_t hb_grid = hb_bounded_grid(num_tokens);
   if (hb_grid < num_tokens) {
+    // Bounded copy: cap the block at 512 threads — the row loop's register
+    // footprint costs co-residency at 1024 (measured 0.86x on sm80); 512
+    // restores stock-parity bandwidth (1.00x, s2b_kernel_prebench).
+    const dim3 hb_block(std::min(block.x, 512u));
     act_and_mul_kernel_hb_bounded<scalar_t, packed_t, ACT_FN, PACKED_ACT_FN,
                                   act_first, use_vec, HAS_CLAMP, use_256b>
-        <<<dim3(hb_grid), block, 0, stream>>>(out, input, d, num_tokens,
-                                              limit, alpha, beta);
+        <<<dim3(hb_grid), hb_block, 0, stream>>>(out, input, d, num_tokens,
+                                                 limit, alpha, beta);
   } else {
     act_and_mul_kernel<scalar_t, packed_t, ACT_FN, PACKED_ACT_FN, act_first,
                        use_vec, HAS_CLAMP, use_256b>
