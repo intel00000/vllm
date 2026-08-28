@@ -323,16 +323,13 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
     const int block_size, const float* k_scale, const float* v_scale,
-    const int kv_scale_stride, const int64_t num_tokens) {
-  // HB S2b: grid-stride token loop (CTA budget; full grid == stock).
-  for (int64_t token_idx = blockIdx.x; token_idx < num_tokens;
-       token_idx += gridDim.x) {
-    const int64_t slot_idx = slot_mapping[token_idx];
-    // NOTE: slot_idx can be -1 if the token is padded (skip, don't return:
-    // this CTA may own later tokens under the budget)
-    if (slot_idx < 0) {
-      continue;
-    }
+    const int kv_scale_stride) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0) {
+    return;
+  }
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const int n_elems = num_heads * head_size;
@@ -401,7 +398,99 @@ __global__ void reshape_and_cache_flash_kernel(
                                          v_op);
     }
   }
-  }  // HB S2b token loop
+}
+
+// ---------------------------------------------------------------------------
+// HB S2b: bounded (grid-stride) COPY of reshape_and_cache_flash_kernel.
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void reshape_and_cache_flash_kernel_hb_bounded(
+    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
+    cache_t* __restrict__ key_cache,     // NHD or HND, shape see comments below
+    cache_t* __restrict__ value_cache,   // same above
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int64_t block_stride, const int64_t page_stride,
+    const int64_t head_stride, const int64_t key_stride,
+    const int64_t value_stride, const int num_heads, const int head_size,
+    const int block_size, const float* k_scale, const float* v_scale,
+    const int kv_scale_stride, const int64_t num_tokens) {
+  // HB S2b bounded copy: grid-stride token loop; original kernel above is
+  // untouched. Padded slots skip (continue), not return.
+  for (int64_t token_idx = blockIdx.x; token_idx < num_tokens;
+       token_idx += gridDim.x) {
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    continue;
+  }
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const int n_elems = num_heads * head_size;
+
+  // pointers to the beginning of the source row for this token.
+  const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
+  const scalar_t* __restrict__ value_src = value + token_idx * value_stride;
+
+  // find the start position inside the kv-cache for this token.
+  cache_t* __restrict__ key_dst =
+      key_cache + block_idx * block_stride + block_offset * page_stride;
+  cache_t* __restrict__ value_dst =
+      value_cache + block_idx * block_stride + block_offset * page_stride;
+
+  // this is true for the NHD layout where `head_stride == head_size`
+  const bool is_contiguous_heads = (head_stride == head_size);
+
+  constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
+
+  if (is_contiguous_heads && kv_scale_stride == 0) {
+    // NHD layout and k/v_scales are [1] (i.e. single scale for all heads)
+    // kv cache: [num_blocks, block_size, num_heads, head_size]
+    float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale;
+    float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale;
+
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+
+    vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
+                                       blockDim.x, k_op);
+    vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                       threadIdx.x, blockDim.x, v_op);
+  } else {
+    // HND layout OR k/v_scales are [num_heads] (i.e. per-attn-head)
+    // HND layout: heads are strided, but each head_size segment is contiguous
+    // kv cache: [num_blocks, num_heads, block_size, head_size]
+    const int lane = threadIdx.x & 31;     // 0..31 within warp
+    const int warp_id = threadIdx.x >> 5;  // warp index within block
+    const int warps_per_block = blockDim.x >> 5;
+
+    for (int head = warp_id; head < num_heads; head += warps_per_block) {
+      const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
+      const scalar_t* __restrict__ v_src_h = value_src + head * head_size;
+
+      cache_t* __restrict__ k_dst_h =
+          key_dst + static_cast<int64_t>(head) * head_stride;
+      cache_t* __restrict__ v_dst_h =
+          value_dst + static_cast<int64_t>(head) * head_stride;
+
+      float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                              ? 0.f
+                              : k_scale[head * kv_scale_stride];
+      float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                              ? 0.f
+                              : v_scale[head * kv_scale_stride];
+
+      CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+      CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+
+      // within each head, let the 32 threads of the warp perform the vector
+      // copy
+      vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane, 32,
+                                         k_op);
+
+      vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane, 32,
+                                         v_op);
+    }
+  }
+  }  // token loop
 }
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
@@ -746,6 +835,20 @@ void reshape_and_cache(
           head_stride, key_stride, value_stride, num_heads, head_size,       \
           block_size, reinterpret_cast<const float*>(k_scale.data_ptr()),    \
           reinterpret_cast<const float*>(v_scale.data_ptr()),                \
+          kv_scale_stride);
+
+// HB S2b macro variant launching the bounded copy.
+#define CALL_RESHAPE_AND_CACHE_FLASH_HB(KV_T, CACHE_T, KV_DTYPE)                \
+  vllm::reshape_and_cache_flash_kernel_hb_bounded<KV_T, CACHE_T, KV_DTYPE>              \
+      <<<hb_dim, block, 0, stream>>>(                                          \
+          reinterpret_cast<KV_T*>(key.data_ptr()),                           \
+          reinterpret_cast<KV_T*>(value.data_ptr()),                         \
+          reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                  \
+          reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                \
+          slot_mapping.const_data_ptr<int64_t>(), block_stride, page_stride, \
+          head_stride, key_stride, value_stride, num_heads, head_size,       \
+          block_size, reinterpret_cast<const float*>(k_scale.data_ptr()),    \
+          reinterpret_cast<const float*>(v_scale.data_ptr()),                \
           kv_scale_stride, num_tokens);
 
 void reshape_and_cache_flash(
@@ -812,13 +915,19 @@ void reshape_and_cache_flash(
                   "k_scale and v_scale must be of shape [1] or [num_heads]");
   int kv_scale_stride = (k_scale.numel() > 1) ? 1 : 0;
 
-  // HB S2b: env-gated CTA budget (decode's ~batch-CTA launches pass under
-  // any sane cap; the 16k-CTA prefill-chunk launches get capped).
-  dim3 grid(vllm::hb_bounded_grid(num_tokens));
+  dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
 
-  DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
-                             CALL_RESHAPE_AND_CACHE_FLASH);
+  // HB S2b: budget branch — stock macro/kernel untouched when off.
+  const int64_t hb_grid = vllm::hb_bounded_grid(num_tokens);
+  if (hb_grid < num_tokens) {
+    dim3 hb_dim(hb_grid);
+    DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
+                               CALL_RESHAPE_AND_CACHE_FLASH_HB);
+  } else {
+    DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
+                               CALL_RESHAPE_AND_CACHE_FLASH);
+  }
 }
 
 // KV_T is the data type of key and value tensors.

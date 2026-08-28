@@ -43,7 +43,7 @@ inline __device__ void apply_rotary_embedding(
                                    // head_size] or [num_tokens, num_kv_heads,
                                    // head_size]
     const cache_t* cache_ptr, const int head_size, const int num_heads,
-    const int num_kv_heads, const int rot_dim, const int64_t token_idx,
+    const int num_kv_heads, const int rot_dim, const int token_idx,
     const int64_t query_stride, const int64_t key_stride,
     const int64_t head_stride, const int64_t rope_dim_offset,
     const bool inverse) {
@@ -88,9 +88,28 @@ __global__ void rotary_embedding_kernel(
     const cache_t* __restrict__ cos_sin_cache,  // [max_position, rot_dim]
     const int rot_dim, const int64_t query_stride, const int64_t key_stride,
     const int64_t head_stride, const int num_heads, const int num_kv_heads,
+    const int head_size, const int64_t rope_dim_offset, const bool inverse) {
+  const int token_idx = blockIdx.x;
+  int64_t pos = positions[token_idx];
+  const cache_t* cache_ptr = cos_sin_cache + pos * rot_dim;
+
+  apply_rotary_embedding<scalar_t, cache_t, IS_NEOX>(
+      query, key, cache_ptr, head_size, num_heads, num_kv_heads, rot_dim,
+      token_idx, query_stride, key_stride, head_stride, rope_dim_offset,
+      inverse);
+}
+
+// ---------------------------------------------------------------------------
+// HB S2b: bounded (grid-stride) COPY of rotary_embedding_kernel. Original
+// untouched; launched only when HB_VLLM_ELTWISE_CTA_BUDGET caps the grid.
+template <typename scalar_t, typename cache_t, bool IS_NEOX>
+__global__ void rotary_embedding_kernel_hb_bounded(
+    const int64_t* __restrict__ positions, scalar_t* __restrict__ query,
+    scalar_t* __restrict__ key, const cache_t* __restrict__ cos_sin_cache,
+    const int rot_dim, const int64_t query_stride, const int64_t key_stride,
+    const int64_t head_stride, const int num_heads, const int num_kv_heads,
     const int head_size, const int64_t num_tokens,
     const int64_t rope_dim_offset, const bool inverse) {
-  // HB S2b: grid-stride token loop (CTA budget; full grid == stock).
   for (int64_t token_idx = blockIdx.x; token_idx < num_tokens;
        token_idx += gridDim.x) {
     int64_t pos = positions[token_idx];
@@ -98,8 +117,8 @@ __global__ void rotary_embedding_kernel(
 
     apply_rotary_embedding<scalar_t, cache_t, IS_NEOX>(
         query, key, cache_ptr, head_size, num_heads, num_kv_heads, rot_dim,
-        token_idx, query_stride, key_stride, head_stride, rope_dim_offset,
-        inverse);
+        static_cast<int>(token_idx), query_stride, key_stride, head_stride,
+        rope_dim_offset, inverse);
   }
 }
 
@@ -169,7 +188,8 @@ void rotary_embedding(
   int64_t head_stride =
       (query_ndim == positions_ndim + 2) ? query.stride(-2) : head_size;
 
-  dim3 grid(vllm::hb_bounded_grid(num_tokens));  // HB S2b CTA budget
+  dim3 grid(num_tokens);
+  const int64_t hb_grid = vllm::hb_bounded_grid(num_tokens);  // HB S2b
   dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
   const torch::stable::accelerator::DeviceGuard device_guard(
       query.get_device_index());
@@ -181,25 +201,53 @@ void rotary_embedding(
             cos_sin_cache.scalar_type(), "rotary_embedding_cache", [&] {
               using cache_t = scalar_t;
               if (is_neox) {
-                vllm::rotary_embedding_kernel<query_t, cache_t, true>
-                    <<<grid, block, 0, stream>>>(
-                        positions.const_data_ptr<int64_t>(),
-                        query.mutable_data_ptr<query_t>(),
-                        key.has_value() ? key->mutable_data_ptr<query_t>()
-                                        : nullptr,
-                        cos_sin_cache.const_data_ptr<cache_t>(), rot_dim,
-                        query_stride, key_stride, head_stride, num_heads,
-                        num_kv_heads, head_size, num_tokens, rope_dim_offset, inverse);
+                if (hb_grid < num_tokens) {
+                  vllm::rotary_embedding_kernel_hb_bounded<query_t, cache_t,
+                                                           true>
+                      <<<dim3(hb_grid), block, 0, stream>>>(
+                          positions.const_data_ptr<int64_t>(),
+                          query.mutable_data_ptr<query_t>(),
+                          key.has_value() ? key->mutable_data_ptr<query_t>()
+                                          : nullptr,
+                          cos_sin_cache.const_data_ptr<cache_t>(), rot_dim,
+                          query_stride, key_stride, head_stride, num_heads,
+                          num_kv_heads, head_size, num_tokens,
+                          rope_dim_offset, inverse);
+                } else {
+                  vllm::rotary_embedding_kernel<query_t, cache_t, true>
+                      <<<grid, block, 0, stream>>>(
+                          positions.const_data_ptr<int64_t>(),
+                          query.mutable_data_ptr<query_t>(),
+                          key.has_value() ? key->mutable_data_ptr<query_t>()
+                                          : nullptr,
+                          cos_sin_cache.const_data_ptr<cache_t>(), rot_dim,
+                          query_stride, key_stride, head_stride, num_heads,
+                          num_kv_heads, head_size, rope_dim_offset, inverse);
+                }
               } else {
-                vllm::rotary_embedding_kernel<query_t, cache_t, false>
-                    <<<grid, block, 0, stream>>>(
-                        positions.const_data_ptr<int64_t>(),
-                        query.mutable_data_ptr<query_t>(),
-                        key.has_value() ? key->mutable_data_ptr<query_t>()
-                                        : nullptr,
-                        cos_sin_cache.const_data_ptr<cache_t>(), rot_dim,
-                        query_stride, key_stride, head_stride, num_heads,
-                        num_kv_heads, head_size, num_tokens, rope_dim_offset, inverse);
+                if (hb_grid < num_tokens) {
+                  vllm::rotary_embedding_kernel_hb_bounded<query_t, cache_t,
+                                                           false>
+                      <<<dim3(hb_grid), block, 0, stream>>>(
+                          positions.const_data_ptr<int64_t>(),
+                          query.mutable_data_ptr<query_t>(),
+                          key.has_value() ? key->mutable_data_ptr<query_t>()
+                                          : nullptr,
+                          cos_sin_cache.const_data_ptr<cache_t>(), rot_dim,
+                          query_stride, key_stride, head_stride, num_heads,
+                          num_kv_heads, head_size, num_tokens,
+                          rope_dim_offset, inverse);
+                } else {
+                  vllm::rotary_embedding_kernel<query_t, cache_t, false>
+                      <<<grid, block, 0, stream>>>(
+                          positions.const_data_ptr<int64_t>(),
+                          query.mutable_data_ptr<query_t>(),
+                          key.has_value() ? key->mutable_data_ptr<query_t>()
+                                          : nullptr,
+                          cos_sin_cache.const_data_ptr<cache_t>(), rot_dim,
+                          query_stride, key_stride, head_stride, num_heads,
+                          num_kv_heads, head_size, rope_dim_offset, inverse);
+                }
               }
             });
       });

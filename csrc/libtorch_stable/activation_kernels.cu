@@ -103,9 +103,67 @@ template <typename scalar_t, typename packed_t,
 __global__ void act_and_mul_kernel(
     scalar_t* __restrict__ out,          // [..., d]
     const scalar_t* __restrict__ input,  // [..., 2, d]
+    const int d, const float limit, const float alpha, const float beta) {
+  const scalar_t* x_ptr = input + blockIdx.x * 2 * d;
+  const scalar_t* y_ptr = x_ptr + d;
+  scalar_t* out_ptr = out + blockIdx.x * d;
+
+  if constexpr (use_vec) {
+    using cuda_t = typename CUDATypeConverter<scalar_t>::Type;
+    using pvec_t = PackedVec<cuda_t, use_256b>;
+
+    const pvec_t* x_vec = reinterpret_cast<const pvec_t*>(x_ptr);
+    const pvec_t* y_vec = reinterpret_cast<const pvec_t*>(y_ptr);
+    pvec_t* out_vec = reinterpret_cast<pvec_t*>(out_ptr);
+    const int num_vecs = d / 2 / pvec_t::NUM_ELTS;
+
+    for (int i = threadIdx.x; i < num_vecs; i += blockDim.x) {
+      pvec_t x, y;
+      if constexpr (use_256b) {
+        ld256(x, &x_vec[i]);
+        ld256(y, &y_vec[i]);
+      } else {
+        ld128(x, &x_vec[i]);
+        ld128(y, &y_vec[i]);
+      }
+#pragma unroll
+      for (int j = 0; j < pvec_t::NUM_ELTS; j++) {
+        x.elts[j] =
+            packed_compute<packed_t, PACKED_ACT_FN, act_first, HAS_CLAMP>(
+                x.elts[j], y.elts[j], limit, alpha, beta);
+      }
+      if constexpr (use_256b) {
+        st256(x, &out_vec[i]);
+      } else {
+        st128(x, &out_vec[i]);
+      }
+    }
+  } else {
+    // Scalar fallback for unaligned data or small d
+    for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+      const scalar_t x = VLLM_LDG(&x_ptr[idx]);
+      const scalar_t y = VLLM_LDG(&y_ptr[idx]);
+      out_ptr[idx] = compute<scalar_t, ACT_FN, act_first, HAS_CLAMP>(
+          x, y, limit, alpha, beta);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HB S2b: bounded (grid-stride) COPY of act_and_mul_kernel plus its host
+// launcher. The original kernel above is untouched — bit-identical binary
+// and launch path when HB_VLLM_ELTWISE_CTA_BUDGET is unset/0; the bounded
+// copy is launched only when the budget caps the grid below num_tokens.
+// Body identical apart from the token loop.
+template <typename scalar_t, typename packed_t,
+          scalar_t (*ACT_FN)(const scalar_t&, const float),
+          packed_t (*PACKED_ACT_FN)(const packed_t&, const float),
+          bool act_first, bool use_vec, bool HAS_CLAMP, bool use_256b = false>
+__global__ void act_and_mul_kernel_hb_bounded(
+    scalar_t* __restrict__ out,          // [..., d]
+    const scalar_t* __restrict__ input,  // [..., 2, d]
     const int d, const int64_t num_tokens, const float limit,
     const float alpha, const float beta) {
-  // HB S2b: grid-stride row loop (CTA budget; full grid == stock behavior).
   for (int64_t token = blockIdx.x; token < num_tokens; token += gridDim.x) {
     const scalar_t* x_ptr = input + token * 2 * d;
     const scalar_t* y_ptr = x_ptr + d;
@@ -142,7 +200,6 @@ __global__ void act_and_mul_kernel(
         }
       }
     } else {
-      // Scalar fallback for unaligned data or small d
       for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
         const scalar_t x = VLLM_LDG(&x_ptr[idx]);
         const scalar_t y = VLLM_LDG(&y_ptr[idx]);
@@ -150,6 +207,30 @@ __global__ void act_and_mul_kernel(
             x, y, limit, alpha, beta);
       }
     }
+  }
+}
+
+// HB S2b host launcher: picks bounded vs ORIGINAL kernel; with the budget
+// off this compiles to exactly the stock launch.
+template <typename scalar_t, typename packed_t,
+          scalar_t (*ACT_FN)(const scalar_t&, const float),
+          packed_t (*PACKED_ACT_FN)(const packed_t&, const float),
+          bool act_first, bool use_vec, bool HAS_CLAMP, bool use_256b = false>
+inline void hb_launch_act_and_mul(scalar_t* out, const scalar_t* input,
+                                  int d, int64_t num_tokens, float limit,
+                                  float alpha, float beta, dim3 block,
+                                  cudaStream_t stream) {
+  const int64_t hb_grid = hb_bounded_grid(num_tokens);
+  if (hb_grid < num_tokens) {
+    act_and_mul_kernel_hb_bounded<scalar_t, packed_t, ACT_FN, PACKED_ACT_FN,
+                                  act_first, use_vec, HAS_CLAMP, use_256b>
+        <<<dim3(hb_grid), block, 0, stream>>>(out, input, d, num_tokens,
+                                              limit, alpha, beta);
+  } else {
+    act_and_mul_kernel<scalar_t, packed_t, ACT_FN, PACKED_ACT_FN, act_first,
+                       use_vec, HAS_CLAMP, use_256b>
+        <<<dim3(num_tokens), block, 0, stream>>>(out, input, d, limit, alpha,
+                                                 beta);
   }
 }
 
@@ -245,7 +326,7 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
   if (num_tokens == 0) {                                                       \
     return;                                                                    \
   }                                                                            \
-  dim3 grid(vllm::hb_bounded_grid(num_tokens)); /* HB S2b CTA budget */        \
+  dim3 grid(num_tokens);                                                       \
   int cc_major = get_device_prop()->major;                                     \
   int support_vec =                                                            \
       (CUDA_VERSION >= 12090 && cc_major >= 10 && num_tokens > 128)            \
@@ -260,35 +341,38 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
     dim3 block(std::min(d / vec_size, 1024));                                  \
     if (CUDA_VERSION >= 12090 && cc_major >= 10 && num_tokens > 128) {         \
       VLLM_STABLE_DISPATCH_FLOATING_TYPES(dtype, "act_and_mul_kernel", [&] {   \
-        vllm::act_and_mul_kernel<                                              \
+        vllm::hb_launch_act_and_mul<                                           \
             scalar_t, typename vllm::PackedTypeConverter<scalar_t>::Type,      \
             KERNEL<scalar_t>,                                                  \
             PACKED_KERNEL<typename vllm::PackedTypeConverter<scalar_t>::Type>, \
-            ACT_FIRST, true, HAS_CLAMP, true><<<grid, block, 0, stream>>>(     \
+            ACT_FIRST, true, HAS_CLAMP, true>(                                 \
             out.mutable_data_ptr<scalar_t>(),                                  \
-            input.const_data_ptr<scalar_t>(), d, num_tokens, LIMIT, ALPHA, BETA);          \
+            input.const_data_ptr<scalar_t>(), d, num_tokens, LIMIT, ALPHA,     \
+            BETA, block, stream);                                              \
       });                                                                      \
     } else {                                                                   \
       VLLM_STABLE_DISPATCH_FLOATING_TYPES(dtype, "act_and_mul_kernel", [&] {   \
-        vllm::act_and_mul_kernel<                                              \
+        vllm::hb_launch_act_and_mul<                                           \
             scalar_t, typename vllm::PackedTypeConverter<scalar_t>::Type,      \
             KERNEL<scalar_t>,                                                  \
             PACKED_KERNEL<typename vllm::PackedTypeConverter<scalar_t>::Type>, \
-            ACT_FIRST, true, HAS_CLAMP, false><<<grid, block, 0, stream>>>(    \
+            ACT_FIRST, true, HAS_CLAMP, false>(                                \
             out.mutable_data_ptr<scalar_t>(),                                  \
-            input.const_data_ptr<scalar_t>(), d, num_tokens, LIMIT, ALPHA, BETA);          \
+            input.const_data_ptr<scalar_t>(), d, num_tokens, LIMIT, ALPHA,     \
+            BETA, block, stream);                                              \
       });                                                                      \
     }                                                                          \
   } else {                                                                     \
     dim3 block(std::min(d, 1024));                                             \
     VLLM_STABLE_DISPATCH_FLOATING_TYPES(dtype, "act_and_mul_kernel", [&] {     \
-      vllm::act_and_mul_kernel<                                                \
+      vllm::hb_launch_act_and_mul<                                             \
           scalar_t, typename vllm::PackedTypeConverter<scalar_t>::Type,        \
           KERNEL<scalar_t>,                                                    \
           PACKED_KERNEL<typename vllm::PackedTypeConverter<scalar_t>::Type>,   \
-          ACT_FIRST, false, HAS_CLAMP><<<grid, block, 0, stream>>>(            \
-          out.mutable_data_ptr<scalar_t>(), input.const_data_ptr<scalar_t>(),  \
-          d, num_tokens, LIMIT, ALPHA, BETA);                                              \
+          ACT_FIRST, false, HAS_CLAMP>(                                        \
+          out.mutable_data_ptr<scalar_t>(),                                    \
+          input.const_data_ptr<scalar_t>(), d, num_tokens, LIMIT, ALPHA,       \
+          BETA, block, stream);                                                \
     });                                                                        \
   }
 
@@ -478,7 +562,7 @@ __global__ void swigluoai_and_mul_kernel(
   if (num_tokens == 0) {                                                       \
     return;                                                                    \
   }                                                                            \
-  dim3 grid(vllm::hb_bounded_grid(num_tokens)); /* HB S2b CTA budget */        \
+  dim3 grid(num_tokens);                                                       \
   int cc_major = get_device_prop()->major;                                     \
   int support_vec =                                                            \
       (CUDA_VERSION >= 12090 && cc_major >= 10 && num_tokens > 128)            \
@@ -616,7 +700,7 @@ __global__ void activation_kernel(
   if (num_tokens == 0) {                                                       \
     return;                                                                    \
   }                                                                            \
-  dim3 grid(vllm::hb_bounded_grid(num_tokens)); /* HB S2b CTA budget */        \
+  dim3 grid(num_tokens);                                                       \
   int cc_major = get_device_prop()->major;                                     \
   int support_vec =                                                            \
       (CUDA_VERSION >= 12090 && cc_major >= 10 && num_tokens > 128)            \
