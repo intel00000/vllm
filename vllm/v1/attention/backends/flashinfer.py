@@ -659,6 +659,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.model_config.max_model_len, self.kv_cache_spec.block_size
         )
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        if os.environ.get("VLLM_DUAL_LANES") == "1":
+            # Lanes worker table is 2x (see gpu/model_runner.py): metadata
+            # rows index by table occupancy, so the persistent paged-kv
+            # buffers must cover it (crash: np.cumsum "out is the wrong
+            # size" at >256 tracked reqs on fast hosts).
+            max_num_reqs *= 2
         max_num_pages = max_num_reqs * max_num_pages_per_req
         speculative_config = vllm_config.speculative_config
         num_spec_tokens = (

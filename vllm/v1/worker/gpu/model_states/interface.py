@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -52,6 +53,11 @@ class ModelState(ABC):
 
         self.max_model_len = self.model_config.max_model_len
         self.max_num_reqs = self.scheduler_config.max_num_seqs
+        if os.environ.get("VLLM_DUAL_LANES") == "1":
+            # Match the worker request table (model_runner.py): lanes track
+            # up to 2x max_num_seqs transiently (finished-but-unreleased +
+            # replacements); per-request state rows must cover the table.
+            self.max_num_reqs *= 2
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
         self.dtype = self.model_config.dtype
