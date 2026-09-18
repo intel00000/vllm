@@ -235,6 +235,20 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        # Allow custom engine step function to be installed via
+        # additional_config["engine_step_fn"] = "<module>.<factory>".
+        #
+        # The factory receives this EngineCore should returns a callable that keeps
+        # step()'s contract (-> (outputs, model_executed)).
+        step_fn_qualname = (
+            vllm_config.additional_config.get("engine_step_fn")
+            if isinstance(vllm_config.additional_config, dict)
+            else None
+        )
+        if step_fn_qualname:
+            from vllm.utils.import_utils import resolve_obj_by_qualname
+
+            self.step_fn = resolve_obj_by_qualname(step_fn_qualname)(self)
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
