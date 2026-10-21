@@ -5,7 +5,7 @@ import os
 import socket
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping
-from copy import copy
+from copy import copy, deepcopy
 from typing import Any
 
 import vllm.envs as envs
@@ -99,6 +99,7 @@ class AsyncLLM(EngineClient):
         client_count: int = 1,
         client_index: int = 0,
         profiler: TorchProfilerWrapper | None = None,
+        engine_core_client: EngineCoreClient | None = None,
     ) -> None:
         """Create an AsyncLLM.
 
@@ -121,6 +122,8 @@ class AsyncLLM(EngineClient):
                 PLEASE BE AWARE THAT STAT LOGGER IS NOT STABLE
                 IN V1, AND ITS BASE CLASS INTERFACE MIGHT CHANGE.
             profiler: Torch profiler wrapper used to trace the frontend.
+            engine_core_client: an already running engine core client to use
+                instead of launching an engine core process.
 
         Returns:
             None
@@ -156,6 +159,10 @@ class AsyncLLM(EngineClient):
             )
 
         self.renderer = renderer = renderer_from_config(self.vllm_config)
+        if engine_core_client is not None and renderer.tokenizer is not None:
+            # Several AsyncLLMs in one process may share a cached tokenizer;
+            # give this one its own copy.
+            renderer.tokenizer = deepcopy(renderer.tokenizer)
 
         # Convert EngineInput --> EngineCoreRequest.
         self.input_processor = InputProcessor(self.vllm_config, renderer)
@@ -181,7 +188,7 @@ class AsyncLLM(EngineClient):
         # warmup only after engine-core fork (the why is in
         # BaseRenderer.start_mm_warmup_in_background). The warmup is joined
         # by reset_mm_cache / warmup / shutdown.
-        self.engine_core = EngineCoreClient.make_async_mp_client(
+        self.engine_core = engine_core_client or EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
